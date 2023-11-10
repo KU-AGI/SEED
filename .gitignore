@@ -3,3 +3,4 @@ pretrained/*
 **/__pycache__/**
 log/
 temp/
+coco_images/*
