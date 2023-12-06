@@ -6,4 +6,5 @@ temp/
 coco_images/*
 *.jpg
 lightning_logs/*
+*.pkl
 ```
