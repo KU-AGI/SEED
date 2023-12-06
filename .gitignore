@@ -4,3 +4,4 @@ pretrained/*
 log/
 temp/
 coco_images/*
+*.jpg
