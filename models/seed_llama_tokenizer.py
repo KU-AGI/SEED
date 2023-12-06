@@ -17,6 +17,8 @@ from torchvision import transforms
 # from diffusers import StableUnCLIPImg2ImgPipeline
 from .pipeline_stable_unclip_img2img import StableUnCLIPImg2ImgPipeline
 
+import pdb
+
 WEIGHTS_NAME = 'seed_quantizer.pt'
 DIFFUSION_NAME = 'diffusion_model'
 
@@ -32,10 +34,14 @@ class ImageTokenizer(nn.Module):
                  **kwargs):
         super().__init__()
         from .seed_qformer.qformer_quantizer import Blip2QformerQuantizer
-
-        model = Blip2QformerQuantizer.from_pretrained(pretrained_model_path=model_path,
-                                                      vit_precision='fp16' if fp16 else 'fp32',
-                                                      **kwargs).eval()
+        pdb.set_trace()
+        is_train = True
+        if is_train:
+            model = Blip2QformerQuantizer(vit_precision='fp16' if fp16 else 'fp32', **kwargs)
+        else:
+            model = Blip2QformerQuantizer.from_pretrained(pretrained_model_path=model_path,
+                                                        vit_precision='fp16' if fp16 else 'fp32',
+                                                        **kwargs).eval()
         if diffusion_model_path is not None and load_diffusion:
             # diffusion_model = DiffusionPipeline.from_pretrained(diffusion_model_path,
             #                                                     torch_dtype=torch.float16 if fp16 else torch.float32)
@@ -86,10 +92,12 @@ class ImageTokenizer(nn.Module):
         if self.fp16:
             img = img.half()
         with torch.no_grad():
+            # id is index of codebook
             id, _ = self.model.get_codebook_indices(img)
         return id.view(img.shape[0], -1)
 
     def decode(self, indices, negative_indices=None, guidance_scale=10, num_inference_steps=20):
+        # image_embed = [1, 1024]
         image_embeds = self.model.get_codebook_entry(indices)
         # image = self.diffusion_model(image_embeds=image_embed,
         #                              noise_level=0,

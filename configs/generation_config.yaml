@@ -1,0 +1,63 @@
+cfg_path: ???
+result_path: ???
+result_file_path: ???
+checkpoint_path: ???
+eval: False
+resume: False
+finetune: False
+
+dist:
+  n_gpus: 1
+  n_nodes: 1
+
+dataset:
+  type: mapstyle
+  name: coco2014
+  loc: bcloud
+  num_workers: 4
+  shuffle: True
+  tokenizer:
+    type: ClipBPE
+    hparams:
+      context_length: 64
+      bpe_pdrop: 0.1
+  transform:
+    type: dalle-vqvae
+    hparams:
+      resolution: 256
+
+stage1:
+  ema_update: False
+
+stage2:
+  image_caption_ratio: 0.5
+
+
+experiment:
+  seed: 0
+  local_batch_size: 1
+  val_batch_size: 1
+  test_split: train
+
+optimizer:
+  type: adamW
+  init_lr: 1e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.96]
+  warmup:
+    warmup_steps: 0
+    multiplier: 1
+    buffer_steps: 0
+    min_lr: 1e-5
+    mode: fix
+    peak_lr: 0.00045 #
+    start_from_zero: True
+  grad_clip_norm: 4.0
+  grad_clip_period: 1
+  loss_txt_weight: 1.0
+  loss_img_weight: 1.0
+  loss_cond_weight: 0.1
+  loss_gen_weight: 0.9
+  sche_type: cosine
+  use_amp: True
+  fp16_grad_comp: True

@@ -3,6 +3,7 @@ from omegaconf import OmegaConf
 from PIL import Image
 import pyrootutils
 import os
+import pdb
 
 pyrootutils.setup_root(__file__, indicator='.project-root', pythonpath=True)
 
@@ -26,6 +27,7 @@ transform = hydra.utils.instantiate(transform_cfg)
 image = Image.open(image_path).convert('RGB')
 
 image_tensor = transform(image).to(device)
+pdb.set_trace()
 image_ids = tokenizer.encode_image(image_torch=image_tensor)
 
 images = tokenizer.decode_image(image_ids)

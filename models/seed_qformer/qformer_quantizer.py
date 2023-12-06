@@ -18,6 +18,7 @@ from einops import rearrange
 from .blip2 import Blip2Base, disabled_train
 from .vit import Block
 from .utils import download_cached_file, is_url
+import pdb
 
 class VectorQuantizer2(nn.Module):
     """
@@ -176,7 +177,8 @@ class Blip2QformerQuantizer(Blip2Base):
                  decode_depth=4,
                  use_recon_s_for_image=False,
                  use_qformer_image=False,
-                 image_features_dim=1024):
+                 image_features_dim=1024,
+                 is_train=False,):
         super().__init__()
 
         self.tokenizer = self.init_tokenizer()
@@ -211,8 +213,8 @@ class Blip2QformerQuantizer(Blip2Base):
             layer.intermediate = None
 
         for name, param in self.Qformer.named_parameters():
-            param.requires_grad = False
-        self.query_tokens.requires_grad = False
+            param.requires_grad = is_train
+        self.query_tokens.requires_grad = is_train
 
         self.quantize = VectorQuantizer2(n_embed, codebook_embed_dim, beta=0.25, remap=None, sane_index_shape=False)
 
@@ -228,12 +230,14 @@ class Blip2QformerQuantizer(Blip2Base):
             nn.Linear(codebook_embed_dim, self.Qformer.config.hidden_size)  # for quantize
         )
 
-        self.quantize = self.quantize.eval()
-        self.quantize.training = False
+        if not is_train:
+            self.quantize = self.quantize.eval()
+
+        self.quantize.training = is_train
         for name, param in self.named_parameters():
             if 'quantize' in name or 'encode_task_layer' in name or 'decode_task_layer' in name:
                 #print('freeze params', name)
-                param.requires_grad = False
+                param.requires_grad = is_train
 
         if self.recon_s:
             self.pos_embed = nn.Parameter(torch.zeros(1, num_query_token, self.Qformer.config.hidden_size))
@@ -286,38 +290,63 @@ class Blip2QformerQuantizer(Blip2Base):
             self.distill_image_proj = nn.Linear(num_query_token * 32, image_features_dim)
 
     def get_codebook_indices(self, image):
-        with torch.no_grad():
-            with self.maybe_autocast():
-                image_embeds = self.ln_vision(self.visual_encoder(image))
-                image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
-            query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
-            query_output = self.Qformer.bert(
-                query_embeds=query_tokens,
-                encoder_hidden_states=image_embeds,
-                encoder_attention_mask=image_atts,
-                return_dict=True,
-            )
+        # Yes grad for training
+        # with torch.no_grad():
+        with self.maybe_autocast():
+            # [b, 257, 1408]
+            image_embeds = self.ln_vision(self.visual_encoder(image))
+            # [b, 256]
+            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+        # [b, 32, 768]
+        # Original query_tokens shape is [1, 32, 768]
+        # Match to batch size
+        query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+        # query_output : [b, 32, 768]
+        query_output = self.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=image_embeds,
+            encoder_attention_mask=image_atts,
+            return_dict=True,
+        )
+        # TODO: query_output should be trained to be similar with text embedding
+        # Image embedding is cross attentioned.
 
-            query_output_down = self.encode_task_layer(query_output.last_hidden_state)
-            quant, loss_embed, embed_ind = self.quantize(query_output_down)
-            embed_ind = embed_ind.reshape(quant.shape[0], -1)
+        # Notice: query_output_down is match to clip embedding?
+        # CLIP ViT-H/14 text embeeding is [b, 1024]. Then it matches to [b, 32, 32]?
+        # [b, 32, 32]
+        query_output_down = self.encode_task_layer(query_output.last_hidden_state)
 
-            query_output_up = self.decode_task_layer(quant)
-
+        # quant [b, 32, 32], loss_embed [b, 32, 768], embed_ind [b, 32]
+        quant, loss_embed, embed_ind = self.quantize(query_output_down)
+        # 
+        embed_ind = embed_ind.reshape(quant.shape[0], -1)
+        # quant embedding dimension is [b, 32, 32]
+        # decoder_task_layer upscale it to [b, 32, 768]
+        # [b, 32, 32] => [b, 32, 768]
+        query_output_up = self.decode_task_layer(quant)
+        # TODO: query_output_up should be trained to be similar with original causal embeddings (query_output)
+        # [b, 32], 
         return embed_ind, query_output_up
 
     def get_codebook_entry(self, indices):
+        # pdb.set_trace()
+        # indicie => [b, 32], quant_embedding => [b, 32, 32]
         quant_embedding = self.quantize.get_codebook_entry(indices)
         # print('quant_embedding_shape: ', quant_embedding.shape)
         # print(self.decode_task_layer)
         # exit()
+        # [b, 32, 768]
         query_output_up = self.decode_task_layer(quant_embedding)
 
         pos_embed_image = self.pos_embed_image.repeat(query_output_up.shape[0], 1, 1)
         query_output_up_pos_image = query_output_up + pos_embed_image
+        # Transformers block
         for blk in self.blocks_image:
             query_output_up_pos_image = blk(query_output_up_pos_image)
+        # Still [b, 32, 768]
         query_output_up = query_output_up_pos_image
+
+        # pdb.set_trace()
 
         if self.use_qformer_image:
             query_atts = torch.ones(query_output_up.size()[:-1], dtype=torch.long).to(query_output_up.device)
@@ -330,9 +359,13 @@ class Blip2QformerQuantizer(Blip2Base):
             )
             reverse_output = reverse_output.last_hidden_state
             reverse_output_proj = self.distill_image_proj(reverse_output).squeeze(1)
+        # Default set to false
         else:
+            # 2 layer mlp to 768 -> 32, [b, 32, 32]
             reverse_output = self.image_down(query_output_up)
+            # [b, 32, 32] => [b, 32 * 32]
             reverse_output = reverse_output.reshape(reverse_output.shape[0], -1)
+            # [b, 1024] => [b, 1024]
             reverse_output_proj = self.distill_image_proj(reverse_output)
 
         return reverse_output_proj

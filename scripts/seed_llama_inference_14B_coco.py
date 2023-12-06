@@ -42,6 +42,9 @@ def generate(tokenizer, input_tokens, generation_config, model):
     generate_ids = generate_ids[0][input_ids.shape[1]:]
     
     return generate_ids
+    
+def decode_text(generate_ids, tokenizer, save_path=None):
+    return tokenizer.decode(generate_ids, skip_special_tokens=True)
 
 def decode_image_text(generate_ids, tokenizer, save_path=None):
 
@@ -79,7 +82,7 @@ transform_cfg_path = 'configs/transform/clip_transform.yaml'
 transform_cfg = OmegaConf.load(transform_cfg_path)
 transform = hydra.utils.instantiate(transform_cfg)
 
-model_cfg = OmegaConf.load('configs/llm/seed_llama_8b.yaml')
+model_cfg = OmegaConf.load('configs/llm/seed_llama_14b.yaml')
 model = hydra.utils.instantiate(model_cfg, torch_dtype=torch.float16)
 model = model.eval().to(device)
 
@@ -182,6 +185,7 @@ if __name__=="__main__":
                     processed_set.add(result["image_id"])
 
         for batch in tqdm(data_loader):
+            import pdb; pdb.set_trace()
             images, paths = batch
 
             # Check if the file is already processed
@@ -196,13 +200,13 @@ if __name__=="__main__":
             batch_img_ids = tokenizer.encode_image(image_torch=image_tensor)
             # img_tokens is a tensor of shape (batch_size, 32)
             batch_input_tokens = []
-            # question = "Caption:"
+            # question = "Make a text description of the image:"
 
             for img_ids in batch_img_ids:
                 img_ids = img_ids.view(-1).cpu().numpy()
                 img_tokens = img_ids_to_img_tokens(img_ids)
                 batch_input_tokens.append(make_coco_caption_input_tokens(img_tokens))
-                #batch_input_tokens.append(img_tokens_to_input_tokens(img_tokens, question))
+                # batch_input_tokens.append(img_tokens_to_input_tokens(img_tokens, question))
             
             input_ids = None
             for input_tokens in batch_input_tokens:
@@ -221,7 +225,7 @@ if __name__=="__main__":
             )
 
             generate_ids = generate_ids[0][input_ids.shape[1]:]
-            prediction = decode_image_text(generate_ids, tokenizer)
+            prediction = decode_text(generate_ids, tokenizer)
             results.append({"image_id": coco_file_name_id[get_file_name(paths[0])], "caption": prediction})
 
             with open(args.result_file, "w") as f:
