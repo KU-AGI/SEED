@@ -288,8 +288,8 @@ class Blip2QformerQuantizer(Blip2Base):
                 nn.Linear(128, 32, bias=False),
             )
             self.distill_image_proj = nn.Linear(num_query_token * 32, image_features_dim)
-
-    def get_codebook_indices(self, image):
+    
+    def get_causal_embeddings(self, image):
         # Yes grad for training
         # with torch.no_grad():
         with self.maybe_autocast():
@@ -308,13 +308,14 @@ class Blip2QformerQuantizer(Blip2Base):
             encoder_attention_mask=image_atts,
             return_dict=True,
         )
-        # TODO: query_output should be trained to be similar with text embedding
-        # Image embedding is cross attentioned.
+        return query_output.last_hidden_state
 
+    def get_codebook_indices(self, image):
+        causal_embeddings = self.get_causal_embeddings(image)
         # Notice: query_output_down is match to clip embedding?
         # CLIP ViT-H/14 text embeeding is [b, 1024]. Then it matches to [b, 32, 32]?
-        # [b, 32, 32]
-        query_output_down = self.encode_task_layer(query_output.last_hidden_state)
+        # [b, 32, 768] => [b, 32, 32]
+        query_output_down = self.encode_task_layer(causal_embeddings)
 
         # quant [b, 32, 32], loss_embed [b, 32, 768], embed_ind [b, 32]
         quant, loss_embed, embed_ind = self.quantize(query_output_down)
@@ -338,13 +339,7 @@ class Blip2QformerQuantizer(Blip2Base):
         # [b, 32, 768]
         query_output_up = self.decode_task_layer(quant_embedding)
 
-        pos_embed_image = self.pos_embed_image.repeat(query_output_up.shape[0], 1, 1)
-        query_output_up_pos_image = query_output_up + pos_embed_image
-        # Transformers block
-        for blk in self.blocks_image:
-            query_output_up_pos_image = blk(query_output_up_pos_image)
-        # Still [b, 32, 768]
-        query_output_up = query_output_up_pos_image
+        query_output_up = self.get_transformer_decoded_embedding(query_output_up)
 
         # pdb.set_trace()
 
@@ -361,14 +356,28 @@ class Blip2QformerQuantizer(Blip2Base):
             reverse_output_proj = self.distill_image_proj(reverse_output).squeeze(1)
         # Default set to false
         else:
-            # 2 layer mlp to 768 -> 32, [b, 32, 32]
-            reverse_output = self.image_down(query_output_up)
-            # [b, 32, 32] => [b, 32 * 32]
-            reverse_output = reverse_output.reshape(reverse_output.shape[0], -1)
-            # [b, 1024] => [b, 1024]
-            reverse_output_proj = self.distill_image_proj(reverse_output)
+            reverse_output_proj = self.get_mlp_decoded_embedding(query_output_up)
 
         return reverse_output_proj
+    
+    def get_mlp_decoded_embedding(self, query_output_up):
+        # 2 layer mlp to 768 -> 32, [b, 32, 32]
+        reverse_output = self.image_down(query_output_up)
+        # [b, 32, 32] => [b, 32 * 32]
+        reverse_output = reverse_output.reshape(reverse_output.shape[0], -1)
+        # [b, 1024] => [b, 1024]
+        reverse_output_proj = self.distill_image_proj(reverse_output)
+        return reverse_output_proj
+
+    def get_transformer_decoded_embedding(self, query_output_up):
+        pos_embed_image = self.pos_embed_image.repeat(query_output_up.shape[0], 1, 1)
+        query_output_up_pos_image = query_output_up + pos_embed_image
+        # Transformers block
+        for blk in self.blocks_image:
+            query_output_up_pos_image = blk(query_output_up_pos_image)
+        # Still [b, 32, 768]
+        query_output_up = query_output_up_pos_image
+        return query_output_up
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path, **kwargs):

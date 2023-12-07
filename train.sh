@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=7,8 python train.py \
+CUDA_VISIBLE_DEVICES=7,8 python train_v2.py \
  cfg_path='configs/generation_config.yaml' \
  tokenizer_cfg_path='configs/tokenizer/seed_llama_tokenizer_hf.yaml' \
  transform_cfg_path='configs/transform/clip_transform.yaml' \
