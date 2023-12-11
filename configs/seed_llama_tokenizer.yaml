@@ -7,12 +7,12 @@ resume: False
 finetune: False
 
 dist:
-  n_gpus: 1
+  n_gpus: 4
   n_nodes: 1
 
 dataset:
-  type: mapstyle
-  name: coco2014
+  type: webdataset
+  name: cc3m_coco
   loc: bcloud
   num_workers: 4
   shuffle: True
@@ -25,6 +25,7 @@ dataset:
     type: dalle-vqvae
     hparams:
       resolution: 256
+  gt_text: True
 
 stage1:
   ema_update: False
@@ -35,29 +36,10 @@ stage2:
 
 experiment:
   seed: 0
-  local_batch_size: 2
-  val_batch_size: 2
+  local_batch_size: 1024
+  val_batch_size: 256
   test_split: train
+  max_epochs: 4
 
 optimizer:
-  type: adamW
-  init_lr: 1e-5
-  weight_decay: 0.01
-  betas: [0.9, 0.96]
-  warmup:
-    warmup_steps: 0
-    multiplier: 1
-    buffer_steps: 0
-    min_lr: 1e-5
-    mode: fix
-    peak_lr: 0.00045 #
-    start_from_zero: True
-  grad_clip_norm: 4.0
-  grad_clip_period: 1
-  loss_txt_weight: 1.0
-  loss_img_weight: 1.0
-  loss_cond_weight: 0.1
-  loss_gen_weight: 0.9
-  sche_type: cosine
-  use_amp: True
   fp16_grad_comp: True

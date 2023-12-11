@@ -31,15 +31,16 @@ class ImageTokenizer(nn.Module):
                  image_size=224,
                  device='cuda',
                  fp16=True,
-                 is_train=False,
+                 from_pretrained=False,
                  **kwargs):
         super().__init__()
         from .seed_qformer.qformer_quantizer import Blip2QformerQuantizer
-        if is_train:
-            model = Blip2QformerQuantizer(vit_precision='fp16' if fp16 else 'fp32', **kwargs)
+        if not from_pretrained:
+            model = Blip2QformerQuantizer(vit_precision='fp16' if fp16 else 'fp32', is_train=True, **kwargs)
         else:
             model = Blip2QformerQuantizer.from_pretrained(pretrained_model_path=model_path,
                                                         vit_precision='fp16' if fp16 else 'fp32',
+                                                        is_train=True,
                                                         **kwargs)#.eval()
         if diffusion_model_path is not None and load_diffusion:
             # diffusion_model = DiffusionPipeline.from_pretrained(diffusion_model_path,

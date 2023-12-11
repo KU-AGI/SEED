@@ -153,13 +153,28 @@ class SEEDTrainingWrapper(LightningModule):
         # ------------------------
         # TODO: Contrastive loss?
         # CLIP ViT-H/14 text embeeding is [b, 1024]. Then it matches to [b, 32, 32]?
-        text_embedding = self.text_down(causal_embeddings.float())
-        text_embedding = text_embedding.reshape(text_embedding.shape[0], -1)
-        text_embedding_proj = self.distill_text_proj(text_embedding)
+        # Make [[], [], ...] list to ['', '', ...] string
+        batch_text = [" ".join(text) for text in batch.gt_txt]
 
-        F.cosine_similarity(text_embedding_proj, gt_text_clip_embeddings)
+        text_tokens = self.image_tokenizer.model.tokenizer(
+            batch_text,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_txt_len,
+            return_tensors="pt",
+        ).to(self.device)
+        text_output = self.image_tokenizer.model.Qformer.bert(
+            input_ids=text_tokens.input_ids,
+            attention_mask=text_tokens.attention_mask,
+            return_dict=True,
+        )
+        text_feat = F.normalize(
+            self.image_tokenizer.model.text_proj(text_output.last_hidden_state[:, 0, :]), dim=-1
+        )
 
-        info_nce_loss = info_nce(text_embedding_proj, gt_text_clip_embeddings)
+        F.cosine_similarity(causal_embeddings, text_feat)
+
+        info_nce_loss = info_nce(causal_embeddings, text_feat)
 
         self.log(
             "info_nce_loss",
@@ -220,7 +235,25 @@ class SEEDTrainingWrapper(LightningModule):
         # [b, 32, 32] => [b, 32, 768]
         query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
 
-        print(F.cosine_similarity(query_output_up, causal_embeddings))
+        # Debugging
+        
+        test_query_output_up = query_output_up
+        for blk in self.image_tokenizer.model.blocks:
+            test_query_output_up = blk(test_query_output_up)
+
+        test_query_output_up_2 = query_output_up
+        for blk in self.image_tokenizer.model.blocks_image:
+            test_query_output_up_2 = blk(test_query_output_up_2)
+        
+        F.cosine_similarity(test_query_output_up, test_query_output_up_2).mean()
+
+        pdb.set_trace()
+        print(F.cosine_similarity(test_query_output_up, causal_embeddings).mean())
+        print(F.cosine_similarity(
+            self.image_tokenizer.model.get_transformer_decoded_embedding(test_query_output_up),
+            causal_embeddings
+        ).mean())
+
 
         # Transformer decoder
         query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
@@ -229,7 +262,7 @@ class SEEDTrainingWrapper(LightningModule):
         # Maximize cosine similarity between query_output_up_pos_image and causal_embeddings
         loss_reconstruction_causal_embedding = F.cosine_similarity(query_output_up, causal_embeddings).mean()
 
-        print(F.cosine_similarity(query_output_up, causal_embeddings))
+        print(F.cosine_similarity(query_output_up, causal_embeddings).mean())
 
         #------------------------
         # Stage 2 - 3 : Reconstruction Generation Embedding
@@ -250,34 +283,13 @@ class SEEDTrainingWrapper(LightningModule):
         gt_text_clip_embeddings = self.get_clip_text_embedding(batch.gt_txt)
 
         # Compare between gt text clip embedding and query_output_up
-        print(F.cosine_similarity(gt_text_clip_embeddings, gt_img_clip_embeddings))
+        print(f"Similarity btw gt img and text : {F.cosine_similarity(gt_text_clip_embeddings, gt_img_clip_embeddings)}")
 
         # Compare between gt text clip embedding and reverse_output_proj
-        print(F.cosine_similarity(gt_text_clip_embeddings, reverse_output_proj))
+        print(f"Sim btw reverse_output and gt text : {F.cosine_similarity(gt_text_clip_embeddings, reverse_output_proj)}")
 
         # Compare between gt image clip embedding and reverse_output_proj
-        print(F.cosine_similarity(gt_img_clip_embeddings, reverse_output_proj))
-        #------------------------
-
-        #------------------------
-        # Debugging
-        # Is possible to reconstruct image from causal embedding?
-        debug_reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(causal_embeddings)
-
-        # reverse_output_proj should be similar to gt_img_clip_embeddings
-        # MSE Loss between reverse_output_proj and gt_img_clip_embeddings
-        print(F.cosine_similarity(debug_reverse_output_proj, reverse_output_proj))
-        print(F.cosine_similarity(debug_reverse_output_proj, gt_img_clip_embeddings))
-        print(F.cosine_similarity(debug_reverse_output_proj, gt_text_clip_embeddings))
-
-        # If after transformer decoder, it is possible to reconstruct image from causal embedding?
-        debug_query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(causal_embeddings)
-        debug_reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(debug_query_output_up)
-
-        print(F.cosine_similarity(debug_reverse_output_proj, reverse_output_proj))
-        print(F.cosine_similarity(debug_reverse_output_proj, gt_img_clip_embeddings))
-        print(F.cosine_similarity(debug_reverse_output_proj, gt_text_clip_embeddings))
-
+        print(f"Sim btw reverse_output and gt img : {F.cosine_similarity(gt_img_clip_embeddings, reverse_output_proj)}")
         #------------------------
 
         pdb.set_trace()
@@ -329,7 +341,7 @@ if __name__ == "__main__":
                            is_train=False)
 
     # Debugging
-    cfg.experiment.local_batch_size = 1
+    cfg.experiment.local_batch_size = 2
     cfg.dist.n_gpus = 1
 
     datamodule = build_datamodule(
@@ -368,11 +380,11 @@ if __name__ == "__main__":
     # Setup training parameters
     image_tokenzier.model.train()
     for param in image_tokenzier.parameters():
-        param.required_grad = True
+        param.requires_grad = True
 
     # Freeze ViT Encoder
     for param in image_tokenzier.model.visual_encoder.parameters():
-        param.required_grad = False
+        param.requires_grad = False
 
     wrapper = SEEDTrainingWrapper(cfg, image_tokenzier)
 

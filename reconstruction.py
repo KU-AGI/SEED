@@ -341,6 +341,7 @@ if __name__ == "__main__":
         log_every_n_steps=2,
         val_check_interval=0.5,
         enable_checkpointing=True,
+        resume_from_checkpoint="my_generation_embedding/lightning_logs/version_0/checkpoints/epoch=0-step=667.ckpt"
     )
 
     # Setup training parameters

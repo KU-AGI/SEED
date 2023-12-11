@@ -194,13 +194,21 @@ class Blip2QformerQuantizer(Blip2Base):
             self.ln_vision.weight.requires_grad = False
             self.ln_vision.bias.requires_grad = False
 
+        # 32
         self.codebook_embed_dim = codebook_embed_dim
+        # 8192
         self.n_embed = n_embed
+        # True
         self.recon_s = recon_s
+        # True
         self.blocks_for_image = blocks_for_image
+        # False
         self.use_recon_s_for_image = use_recon_s_for_image
+        # 4
         self.depth = decode_depth
+        # 1024
         self.image_features_dim = image_features_dim
+        # False
         self.use_qformer_image = use_qformer_image
 
         self.Qformer, self.query_tokens = self.init_Qformer(num_query_token, self.visual_encoder.num_features)
@@ -218,12 +226,14 @@ class Blip2QformerQuantizer(Blip2Base):
 
         self.quantize = VectorQuantizer2(n_embed, codebook_embed_dim, beta=0.25, remap=None, sane_index_shape=False)
 
+        # 768 => 32
         self.encode_task_layer = nn.Sequential(
             nn.Linear(self.Qformer.config.hidden_size, self.Qformer.config.hidden_size),
             nn.Tanh(),
             nn.Linear(self.Qformer.config.hidden_size, codebook_embed_dim)  # for quantize
         )
 
+        # 32 => 768
         self.decode_task_layer = nn.Sequential(
             nn.Linear(codebook_embed_dim, codebook_embed_dim),
             nn.Tanh(),
@@ -370,14 +380,18 @@ class Blip2QformerQuantizer(Blip2Base):
         return reverse_output_proj
 
     def get_transformer_decoded_embedding(self, query_output_up):
-        pos_embed_image = self.pos_embed_image.repeat(query_output_up.shape[0], 1, 1)
-        query_output_up_pos_image = query_output_up + pos_embed_image
+        query_output_up_pos_image = self.add_positional_embedding(query_output_up)
         # Transformers block
         for blk in self.blocks_image:
             query_output_up_pos_image = blk(query_output_up_pos_image)
         # Still [b, 32, 768]
         query_output_up = query_output_up_pos_image
         return query_output_up
+
+    def add_positional_embedding(self, query_output_up):
+        pos_embed_image = self.pos_embed_image.repeat(query_output_up.shape[0], 1, 1)
+        query_output_up_pos_image = query_output_up + pos_embed_image
+        return query_output_up_pos_image
 
     @classmethod
     def from_pretrained(cls, pretrained_model_path, **kwargs):

@@ -21,7 +21,7 @@ def to_attr_dict(cfg):
     cfg = AttrDict.from_nested_dicts(c)
     return cfg
 
-def build_config(struct=False, cfg_path='./configs/generation_config.yaml'):
+def build_config(struct=False, cfg_path=None):
     cfg = OmegaConf.load(cfg_path)
     OmegaConf.set_struct(cfg, struct)
     cfg = override_from_file_name(cfg)
