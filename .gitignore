@@ -9,4 +9,5 @@ lightning_logs/*
 *.pkl
 evaluation/*
 *.pth
+stage2_debugging/*
 ```
