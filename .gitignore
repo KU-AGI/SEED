@@ -10,4 +10,5 @@ lightning_logs/*
 evaluation/*
 *.pth
 stage2_debugging/*
+*.ckpt
 ```
