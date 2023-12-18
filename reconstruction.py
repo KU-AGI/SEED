@@ -87,7 +87,6 @@ class SEEDTrainingWrapper(LightningModule):
         )
 
         self.B = None
-
         
         # My code
         # For make clip embedding directly from [b, 32, 32] to [b, 1024]
@@ -145,7 +144,7 @@ class SEEDTrainingWrapper(LightningModule):
     def get_causal_embeddings(self, image):
         return self.image_tokenizer.model.get_causal_embeddings(image)
 
-    def get_stage_2_loss(self, batch, batch_idx: int, is_validation=False):
+    def test_step(self, batch, batch_idx: int):
         """_summary_
 
         Args:
@@ -172,121 +171,26 @@ class SEEDTrainingWrapper(LightningModule):
         for blk in self.embedding_block:
             quant = blk(quant)
         quant = quant.view(quant.shape[0], -1)
-        quant = self.embedding_proj(quant)
+        generation_embedding = self.embedding_proj(quant)
 
         gt_img_clip_embeddings = self.get_clip_img_embedding(batch.img)
-        
-        loss = F.mse_loss(quant, gt_img_clip_embeddings)
 
-        #------------------------
-        # Logging
-
-        if not is_validation:
-            self.logging_train(quant, loss_embed, gt_img_clip_embeddings, loss)
-        else:
-            self.logging_val(quant, loss_embed, gt_img_clip_embeddings, loss)
-            self.sample_embed_ind = embed_ind.reshape(self.B, -1)
-
-        return loss + loss_embed.mean()
-
-    def logging_train(self, quant, loss_embed, gt_img_clip_embeddings, loss):
-        self.log(
-            "train/generation_embed_loss",
-            loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-
-        self.log(
-            "train/codebook_loss_embed",
-            loss_embed.mean(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-
-        # Learning rate logging
-        self.log(
-            "train/learning_rate",
-            self.trainer.optimizers[0].param_groups[0]["lr"],
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-
-        # Cosine similarity logging
-        self.log(
-            "train/stage_2_codebook_cosine_similarity",
-            F.cosine_similarity(quant, gt_img_clip_embeddings).mean(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
+        print(F.cosine_similarity(generation_embedding, gt_img_clip_embeddings, dim=1))
     
-    def logging_val(self, quant, loss_embed, gt_img_clip_embeddings, loss):
-        self.log(
-            "val/generation_embed_loss",
-            loss,
-            sync_dist=True,
-        )
+        pdb.set_trace()
 
-        self.log(
-            "val/codebook_loss_embed",
-            loss_embed.mean(),
-            sync_dist=True,
-        )
+        image = self.image_tokenizer.diffusion_model(
+            image_embeds=generation_embedding.type(torch.float16),
+            negative_image_embeds=None,
+            guidance_scale=10,
+            noise_level=0,
+            num_inference_steps=20,
+            latents=self.image_tokenizer.latents,
+        ).images
 
-        # Learning rate logging
-        self.log(
-            "val/learning_rate",
-            self.trainer.optimizers[0].param_groups[0]["lr"],
-            sync_dist=True,
-        )
-
-        # Cosine similarity logging
-        self.log(
-            "val/stage_2_codebook_cosine_similarity",
-            F.cosine_similarity(quant, gt_img_clip_embeddings).mean(),
-            sync_dist=True,
-        )
-
-    def training_step(self, batch, batch_idx: int):
-        self.B = batch.img.shape[0]
-        # gt_text is a list of string
-        # Encoding text in list to ascii
-        batch.gt_txt = [[text[0].encode("ascii", "ignore").decode()] for text in batch.gt_txt]
-
-        stage_2_loss = self.get_stage_2_loss(batch, batch_idx)
-        return stage_2_loss
-
-    def validation_step(self, batch, batch_idx: int):
-        self.B = batch.img.shape[0]
-        # gt_text is a list of string
-        # Encoding text in list to ascii
-        batch.gt_txt = [[text[0].encode("ascii", "ignore").decode()] for text in batch.gt_txt]
-
-        stage_2_loss = self.get_stage_2_loss(batch, batch_idx, is_validation=True)
-        return stage_2_loss
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
-        scheduler = transformers.get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=80, num_training_steps=2668
-        )
-
-        lr_scheduler_config = {
-            "scheduler": scheduler,
-            "name": "learning_rate",
-            "interval": "step",
-            "frequency": 1,
-        }
-
-        return {"optimizer": optimizer, "lr_scheduler": lr_scheduler_config}
+        pdb.set_trace()
+        
+        return
 
 
 if __name__ == "__main__":
@@ -304,11 +208,13 @@ if __name__ == "__main__":
     image_tokenzier = ImageTokenizer(model_path='pretrained/seed_tokenizer/seed_quantizer.pt',
                            fp16=False,
                            from_pretrained=True,
+                           load_diffusion=True,
+                           diffusion_model_path='stabilityai/stable-diffusion-2-1-unclip'
                            )
 
     # Debugging
-    # cfg.experiment.local_batch_size = 2
-    # cfg.dist.n_gpus = 1
+    cfg.experiment.local_batch_size = 2
+    cfg.dist.n_gpus = 1
 
     datamodule = build_datamodule(
         cfg=cfg,
@@ -320,28 +226,20 @@ if __name__ == "__main__":
     )
 
     datamodule.setup()
-    train_dataloader = datamodule.train_dataloader()
     val_dataloader = datamodule.val_dataloader()
+    val_dataloader.dataset.set_custom_length(30000)
 
-    tb_logger = pl_loggers.TensorBoardLogger(save_dir="./my_generation_embedding/")
     trainer = pl.Trainer(
         accelerator="gpu",
         num_nodes=cfg.dist.n_nodes,
         devices=cfg.dist.n_gpus,
         strategy=DDPStrategy(
-            find_unused_parameters=True,
-            ddp_comm_hook=default_hooks.fp16_compress_hook
-            if cfg.optimizer.fp16_grad_comp
-            else None,
+            find_unused_parameters=False,
         ),
-        max_epochs=cfg.experiment.max_epochs,
-        limit_test_batches=1.0,
+        max_epochs=1,
+        enable_checkpointing=False,
+        enable_model_summary=False,
         deterministic=True,
-        logger=tb_logger,
-        log_every_n_steps=2,
-        val_check_interval=0.5,
-        enable_checkpointing=True,
-        resume_from_checkpoint="my_generation_embedding/lightning_logs/version_0/checkpoints/epoch=0-step=667.ckpt"
     )
 
     # Setup training parameters
@@ -353,9 +251,10 @@ if __name__ == "__main__":
     for param in image_tokenzier.model.visual_encoder.parameters():
         param.requires_grad = False
 
-    wrapper = SEEDTrainingWrapper(cfg, image_tokenzier)
+    wrapper = SEEDTrainingWrapper.load_from_checkpoint("my_generation_embedding/lightning_logs/version_0/checkpoints/epoch=0-step=667.ckpt", cfg=cfg, model=image_tokenzier)
+    wrapper.eval()
 
-    trainer.fit(
-        wrapper, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader
+    trainer.test(
+        wrapper, dataloaders=val_dataloader
     )
     trainer.strategy.barrier()

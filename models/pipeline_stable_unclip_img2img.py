@@ -33,6 +33,8 @@ from diffusers.utils import is_accelerate_version, logging, randn_tensor, replac
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 from diffusers.pipelines.stable_diffusion.stable_unclip_image_normalizer import StableUnCLIPImageNormalizer
 
+import pdb
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 EXAMPLE_DOC_STRING = """
@@ -665,6 +667,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
                 [`~ pipeline_utils.ImagePipelineOutput`] if `return_dict` is True, otherwise a `tuple`. When returning
                 a tuple, the first element is a list with the generated images.
         """
+        pdb.set_trace()
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
@@ -683,8 +686,10 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
             negative_prompt=negative_prompt,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
+            # Only image_embeds is not None, [b, 1024]
             image_embeds=image_embeds,
         )
+
 
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
@@ -705,6 +710,9 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
 
         # 3. Encode input prompt
         text_encoder_lora_scale = (cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None)
+       
+        # [b, 77, 1024] 
+        # Now img2img, prompt_embeds is None
         prompt_embeds = self._encode_prompt(
             prompt=prompt,
             device=device,
@@ -717,6 +725,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
         )
 
         # 4. Encoder input image
+        # 2 * [b, 1024]
         noise_level = torch.tensor([noise_level], device=device)
         image_embeds = self._encode_image(
             image=image,
@@ -732,10 +741,12 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
 
         # 5. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
+        # 21 length list
         timesteps = self.scheduler.timesteps
 
         # 6. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
+        # Latent is [b, 4, 96, 96]
         latents = self.prepare_latents(
             batch_size=batch_size,
             num_channels_latents=num_channels_latents,
@@ -752,10 +763,15 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
 
         # 8. Denoising loop
         for i, t in enumerate(self.progress_bar(timesteps)):
+            pdb.set_trace()
+            # latents = [b, 4, 96, 96]
+            # Because of classifier free guidance, we need to duplicate the latents
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+            # Now latents = [2, 4, 96, 96]
 
             # predict the noise residual
+            # [1, 4, 96, 96]
             noise_pred = self.unet(
                 latent_model_input,
                 t,

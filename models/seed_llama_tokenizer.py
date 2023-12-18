@@ -42,9 +42,11 @@ class ImageTokenizer(nn.Module):
                                                         vit_precision='fp16' if fp16 else 'fp32',
                                                         is_train=True,
                                                         **kwargs)#.eval()
+
         if diffusion_model_path is not None and load_diffusion:
             # diffusion_model = DiffusionPipeline.from_pretrained(diffusion_model_path,
             #                                                     torch_dtype=torch.float16 if fp16 else torch.float32)
+            pdb.set_trace()
             diffusion_model = StableUnCLIPImg2ImgPipeline.from_pretrained(diffusion_model_path,
                                                                           torch_dtype=torch.float16 if fp16 else torch.float32)
             self.diffusion_model = diffusion_model.to(device)
