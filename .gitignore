@@ -11,4 +11,5 @@ evaluation/*
 *.pth
 stage2_debugging/*
 *.ckpt
+my_generation_embedding/*
 ```
