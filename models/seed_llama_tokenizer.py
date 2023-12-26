@@ -32,6 +32,7 @@ class ImageTokenizer(nn.Module):
                  device='cuda',
                  fp16=True,
                  from_pretrained=False,
+                 is_train=True,
                  **kwargs):
         super().__init__()
         from .seed_qformer.qformer_quantizer import Blip2QformerQuantizer
@@ -46,14 +47,14 @@ class ImageTokenizer(nn.Module):
         if diffusion_model_path is not None and load_diffusion:
             # diffusion_model = DiffusionPipeline.from_pretrained(diffusion_model_path,
             #                                                     torch_dtype=torch.float16 if fp16 else torch.float32)
-            pdb.set_trace()
             diffusion_model = StableUnCLIPImg2ImgPipeline.from_pretrained(diffusion_model_path,
                                                                           torch_dtype=torch.float16 if fp16 else torch.float32)
-            self.diffusion_model = diffusion_model.to(device)
         else:
             self.diffusion_model = None
 
         model = model.to(device)
+        if diffusion_model is not None:
+            diffusion_model = diffusion_model.to(device)
 
         processor = transforms.Compose([
             transforms.Resize((image_size, image_size), interpolation=3),
@@ -73,6 +74,8 @@ class ImageTokenizer(nn.Module):
         self.noise = torch.randn(shape_noise, generator=None, device=device, dtype=torch.float16, layout=torch.strided)
 
         self.model = model
+        if diffusion_model is not None:
+            self.diffusion_model = diffusion_model
         self.processor = processor
         self.device = device
         self.fp16 = fp16

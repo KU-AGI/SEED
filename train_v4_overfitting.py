@@ -38,6 +38,7 @@ import transformers
 from pytorch_lightning import loggers as pl_loggers
 from functools import partial
 from models.seed_qformer.vit import Block
+from pytorch_lightning.callbacks import ModelSummary
 
 import numpy as np
 from PIL import Image
@@ -184,6 +185,43 @@ class SEEDTrainingWrapper(LightningModule):
 
         return quant, loss_embed, embed_ind
 
+    def get_original_stage2_quant(self, img):
+        causal_embeddings = self.get_causal_embeddings(img)
+
+        # TODO: query_output should be trained to be similar with text embedding
+        # Image embedding is cross attentioned.
+        # Notice: query_output_down is match to clip embedding?
+        # [b, 32, 32]
+        query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
+
+        # quant [b, 32, 32], loss_embed [b, 32, 768], embed_ind [b, 32]
+        quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
+
+        #------------------------
+        # Stage 2 - 2 : Reconstruction Caual Embedding
+        #------------------------
+
+        # quant embedding dimension is [b, 32, 32]
+        # decoder_task_layer upscale it to [b, 32, 768]
+        # [b, 32, 32] => [b, 32, 768]
+        query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
+
+        # Transformer decoder
+        query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
+
+        # query_output_up_pos_image should be similar to original causal_embeddings
+        # Maximize cosine similarity between query_output_up_pos_image and causal_embeddings
+
+        #------------------------
+        # Stage 2 - 3 : Reconstruction Generation Embedding
+        #------------------------
+
+        # MLP
+        reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
+
+        return reverse_output_proj, loss_embed, embed_ind
+
+
     def get_stage_2_loss(self, batch, batch_idx: int, is_validation=False):
         """_summary_
 
@@ -218,7 +256,7 @@ class SEEDTrainingWrapper(LightningModule):
     def get_stage_diffusion_loss(self, batch, batch_idx: int, is_validation=False):
         clip_image = transforms.Resize((224, 224))(batch.img)
         gt_img_clip_embeddings = self.get_clip_img_embedding(clip_image.float())
-        image_embeds, _, _ = self.get_stage2_quant(clip_image)
+        image_embeds, _, _ = self.get_original_stage2_quant(clip_image)
 
         # Debug
         # self.image_tokenizer.diffusion_model(
@@ -363,19 +401,19 @@ class SEEDTrainingWrapper(LightningModule):
         return stage_diffusion_loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-5)
-        scheduler = transformers.get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=80, num_training_steps=2668
-        )
+        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-5, betas=(0.9, 0.999), weight_decay=1e-8)
+        # scheduler = transformers.get_cosine_schedule_with_warmup(
+        #     optimizer, num_warmup_steps=80, num_training_steps=2668
+        # )
 
-        lr_scheduler_config = {
-            "scheduler": scheduler,
-            "name": "learning_rate",
-            "interval": "step",
-            "frequency": 1,
-        }
+        # lr_scheduler_config = {
+        #     "scheduler": scheduler,
+        #     "name": "learning_rate",
+        #     "interval": "step",
+        #     "frequency": 1,
+        # }
 
-        return {"optimizer": optimizer, "lr_scheduler": lr_scheduler_config}
+        return {"optimizer": optimizer} #"lr_scheduler": lr_scheduler_config}
 
 
 if __name__ == "__main__":
@@ -429,6 +467,9 @@ if __name__ == "__main__":
         enable_checkpointing=True,
         # Debug
         num_sanity_val_steps=0,
+        overfit_batches=0.04,
+        callbacks=[ModelSummary(max_depth=2)],
+        accumulate_grad_batches=100
     )
 
 
