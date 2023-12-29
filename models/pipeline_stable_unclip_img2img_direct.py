@@ -723,24 +723,10 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
             num_images_per_prompt=num_images_per_prompt,
             do_classifier_free_guidance=do_classifier_free_guidance,
             negative_prompt=negative_prompt,
-            prompt_embeds=prompt_embeds,
+            # For test, use image_embeds as prompt_embeds
+            prompt_embeds=image_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             lora_scale=text_encoder_lora_scale,
-        )
-
-        # 4. Encoder input image
-        # 2 * [b, 1024]
-        noise_level = torch.tensor([noise_level], device=device)
-        image_embeds = self._encode_image(
-            image=image,
-            device=device,
-            batch_size=batch_size,
-            num_images_per_prompt=num_images_per_prompt,
-            do_classifier_free_guidance=do_classifier_free_guidance,
-            noise_level=noise_level,
-            generator=generator,
-            image_embeds=image_embeds,
-            negative_image_embeds=negative_image_embeds,
         )
 
         # 5. Prepare timesteps
@@ -779,7 +765,6 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
                 latent_model_input,
                 t,
                 encoder_hidden_states=prompt_embeds,
-                class_labels=image_embeds,
                 cross_attention_kwargs=cross_attention_kwargs,
                 return_dict=False,
             )[0]
@@ -819,7 +804,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
         prompt: Union[str, List[str]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
-        num_training_steps: int = 1000,
+        num_training_steps: int = 20,
         guidance_scale: float = 1,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
