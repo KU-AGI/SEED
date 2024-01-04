@@ -12,7 +12,7 @@ resume: False
 finetune: False
 
 dist:
-  n_gpus: 2
+  n_gpus: 1
   n_nodes: 1
 
 dataset:
@@ -40,13 +40,14 @@ stage2:
 
 experiment:
   seed: 0
-  local_batch_size: 2
-  val_batch_size: 2
+  local_batch_size: 1
+  val_batch_size: 1
   test_split: train
-  max_epochs: 50
-  grad_accumulation: 16
-  overfit_batches: 1.0
-  val_check_interval: 100
+  max_epochs: 10000
+  grad_accumulation: 1
+  # overfit_batches: 1.0
+  # val_check_interval: 100
+  check_val_every_n_epoch: 10
 
 optimizer:
   fp16: False

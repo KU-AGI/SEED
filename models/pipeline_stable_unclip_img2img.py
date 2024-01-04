@@ -744,6 +744,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
         )
 
         # 5. Prepare timesteps
+
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         # 21 length list
         timesteps = self.scheduler.timesteps

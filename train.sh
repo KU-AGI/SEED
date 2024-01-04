@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=1 python train_v4_overfitting.py \
+CUDA_VISIBLE_DEVICES=4,5 python train_v4_overfitting.py \
  cfg_path='configs/overfitting_test.yaml' \
  tokenizer_cfg_path='configs/tokenizer/seed_llama_tokenizer_hf.yaml' \
  transform_cfg_path='configs/transform/diffusion_transform.yaml' \

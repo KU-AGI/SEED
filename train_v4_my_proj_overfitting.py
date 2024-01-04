@@ -115,12 +115,13 @@ class SEEDTrainingWrapper(LightningModule):
         self.sample_embed_ind = None
         self.pil_to_tensor = transforms.ToTensor()
         self.sample_image_ind = 0
+        self.logged_original_image = set()
 
     def setup(self, stage):
         # Setup training parameter
         self.image_tokenizer.model.train()
         for param in self.image_tokenizer.model.parameters():
-            param.requires_grad = False
+            param.requires_grad = True
 
         # Freeze ViT Encoder
         for param in self.image_tokenizer.model.visual_encoder.parameters():
@@ -133,10 +134,9 @@ class SEEDTrainingWrapper(LightningModule):
             param.requires_grad = False
         for param in self.image_tokenizer.diffusion_model.text_encoder.parameters():
             param.requires_grad = False
-        # Except for unet
+        # In this case, unet is frozen
         for param in self.image_tokenizer.diffusion_model.unet.parameters():
-            param.requires_grad = True
-        self.image_tokenizer.diffusion_model.unet.train()
+            param.requires_grad = False
         for param in self.image_tokenizer.diffusion_model.vae.parameters():
             param.requires_grad = False
 
@@ -189,22 +189,24 @@ class SEEDTrainingWrapper(LightningModule):
         Returns:
             float: clip image embedding [b, 1024]
         """        
-        return self.image_encoder.encode_image(batch_img.to(self.device))
+        return self.image_encoder(batch_img).image_embeds.to(self.device)
 
     def get_causal_embeddings(self, image):
         return self.image_tokenizer.model.get_causal_embeddings(image)
 
     def get_stage2_quant(self, img):
         # Causal embedding is trained in stage 1.
-        with torch.no_grad():
-            causal_embeddings = self.get_causal_embeddings(img)
+        causal_embeddings = self.get_causal_embeddings(img)
 
         # [b, 32, 32]
         query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
 
-        # quant [b, 32, 32], loss_embed [b, 32, 768], embed_ind [b, 32]
-        quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
+        # For debug
+        quant = query_output_down
+        loss_embed = None
+        embed_ind = None
 
+        # Simple flatten and linear projection
         for blk in self.embedding_block:
             quant = blk(quant)
         quant = quant.view(quant.shape[0], -1)
@@ -516,7 +518,7 @@ class SEEDTrainingWrapper(LightningModule):
         clip_size_image = self.transform_224(batch.img)
         # For cosine similarity logging
         gt_img_clip_embeddings = self.get_clip_img_embedding(clip_size_image.float())
-        image_embeds, _, _ = self.get_original_stage2_quant(clip_size_image)
+        image_embeds, _, _ = self.get_stage2_quant(clip_size_image)
 
         # Debug
         # self.image_tokenizer.diffusion_model(
@@ -537,6 +539,29 @@ class SEEDTrainingWrapper(LightningModule):
             clean_image=batch.img,
         )
 
+        # For logging
+        with torch.no_grad():
+            gt_loss_diffusion = self.train_diffusion(
+                image_embeds=gt_img_clip_embeddings,
+                negative_image_embeds=None,
+                noise_level=0,
+                num_training_steps=1000,
+                latents=self.image_tokenizer.latents,
+                clean_image=batch.img,
+            )
+
+        with torch.no_grad():
+            random_loss_diffusion = self.train_diffusion(
+                image_embeds=torch.randn_like(image_embeds),
+                negative_image_embeds=None,
+                noise_level=0,
+                num_training_steps=1000,
+                latents=self.image_tokenizer.latents,
+                clean_image=batch.img,
+            )
+
+        
+
         if is_validation:
             self.log(
                 "val/loss_diffusion",
@@ -554,6 +579,22 @@ class SEEDTrainingWrapper(LightningModule):
             self.log(
                 "train/loss_diffusion",
                 loss_diffusion,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+            self.log(
+                "train/gt_loss_diffusion",
+                gt_loss_diffusion,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+            self.log(
+                "train/random_loss_diffusion",
+                random_loss_diffusion,
                 on_step=True,
                 on_epoch=True,
                 prog_bar=True,
@@ -616,7 +657,7 @@ class SEEDTrainingWrapper(LightningModule):
             F.cosine_similarity(quant, gt_img_clip_embeddings).mean(),
             sync_dist=True,
         )
-
+    
     def training_step(self, batch, batch_idx: int):
         self.B = batch.img.shape[0]
         # gt_text is a list of string
@@ -625,33 +666,82 @@ class SEEDTrainingWrapper(LightningModule):
 
         # stage_2_loss = self.get_stage_2_loss(batch, batch_idx)
         stage_diffusion_loss = self.get_stage_diffusion_loss(batch, batch_idx)
+
         return stage_diffusion_loss
 
     def validation_step(self, batch, batch_idx: int):
-        if batch_idx > 2:
-            return
-
         image = self.transform_224(batch.img)
+        image_embeds, _, _ = self.get_stage2_quant(image)
 
-        indices = self.image_tokenizer.encode(
-            image_torch=image
-        )
+        reconstructed_images = self.image_tokenizer.diffusion_model(
+            image_embeds=image_embeds,
+            negative_image_embeds=None,
+            guidance_scale=10,
+            noise_level=0,
+            num_inference_steps=100,
+            latents=self.image_tokenizer.latents,
+        ).images
 
-        reconstructed_images = self.image_tokenizer.decode(indices, num_inference_steps=100)
         tensor_images = []
         for img in reconstructed_images:
             tensor_images.append(self.pil_to_tensor(img).unsqueeze(0))
         tensor_images = torch.cat(tensor_images, dim=0)
 
-        self.logger.experiment.add_images(
-            f"images/epoch_{self.current_epoch}/image_batch_{batch_idx}/{self.sample_image_ind}",
-            tensor_images,
+        # Check if image is already logged
+        if batch_idx not in self.logged_original_image:
+            self.logger.experiment.add_images(
+                f"original/image_batch_{batch_idx}",
+                batch.img,
+            )
+
+            self.logger.experiment.add_images(
+                f"original/image_batch_{batch_idx}_seed_reconstructed",
+                tensor_images,
+            )
+
+            # logging original caption
+            self.logger.experiment.add_text(
+                f"original/gt_text_image_batch_{batch_idx}",
+                batch.gt_txt[0][0],
+            )
+
+            self.logged_original_image.add(batch_idx)
+        else:
+            self.logger.experiment.add_images(
+                f"images/image_batch_{batch_idx}",
+                tensor_images,
+                global_step=self.sample_image_ind,
+            )
+            self.sample_image_ind += 1
+
+        # logging weight distribution to check if weight is updated (gradient is flowing)
+        self.logger.experiment.add_histogram(
+            "weight_distribution/image_tokenizer/model/Qformer/bert/encoder/layer/0/attention/self/value",
+            next(self.image_tokenizer.model.Qformer.bert.encoder.layer[0].attention.self.value.parameters()),
+            global_step=self.global_step,
         )
-        self.sample_image_ind += 1
+
+        self.logger.experiment.add_histogram(
+            "weight_distribution/image_tokenizer/model/Qformer/bert/encoder/layer/1/attention/self/value",
+            next(self.image_tokenizer.model.Qformer.bert.encoder.layer[1].attention.self.value.parameters()),
+            global_step=self.global_step,
+        )
+
+        self.logger.experiment.add_histogram(
+            "weight_distribution/image_tokenizer/model/Qformer/bert/encoder/layer/7/attention/self/value",
+            next(self.image_tokenizer.model.Qformer.bert.encoder.layer[7].attention.self.value.parameters()),
+            global_step=self.global_step,
+        )
+        
+        self.logger.experiment.add_histogram(
+            "weight_distribution/embedding_proj",
+            next(self.embedding_proj.parameters()),
+            global_step=self.global_step,
+        )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-8)
-        scheduler = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=100, num_training_steps=10000)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, betas=(0.9, 0.999), weight_decay=1e-8)
+        scheduler = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=100, num_training_steps=5000)
 
         lr_scheduler_config = {
             "scheduler": scheduler,
@@ -676,9 +766,6 @@ if __name__ == "__main__":
     transform = hydra.utils.instantiate(transform_cfg)
 
     os.makedirs(cfg.result_file_path, exist_ok=True)
-
-    # Empty Image tokenizer model
-    # BLIP2QformerQuantizer is loaded inside ImageTokenizer
 
     datamodule = build_datamodule(
         cfg=cfg,
@@ -715,9 +802,9 @@ if __name__ == "__main__":
         check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
         enable_checkpointing=True,
         # Debug
-        num_sanity_val_steps=1,
+        num_sanity_val_steps=2,
         # overfit_batches=cfg.experiment.overfit_batches,
-        callbacks=[ModelSummary(max_depth=1), lr_logger],
+        callbacks=[ModelSummary(max_depth=3), lr_logger],
         accumulate_grad_batches=cfg.experiment.grad_accumulation
     )
 
