@@ -207,8 +207,9 @@ class SEEDTrainingWrapper(LightningModule):
         embed_ind = None
 
         # Simple flatten and linear projection
-        for blk in self.embedding_block:
-            quant = blk(quant)
+        # Debug : Try to use transformer
+        # for blk in self.embedding_block:
+        #     quant = blk(quant)
         quant = quant.view(quant.shape[0], -1)
         quant = self.embedding_proj(quant)
 
