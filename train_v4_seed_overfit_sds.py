@@ -49,6 +49,12 @@ import numpy as np
 from PIL import Image
 import pdb
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from torch.cuda.amp import custom_bwd, custom_fwd
+
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
@@ -61,8 +67,21 @@ NUM_IMG_TOKNES = 32
 NUM_IMG_CODES = 8192
 image_id_shift = 32000
 
-pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
+class SpecifyGradient(torch.autograd.Function):
+    @staticmethod
+    @custom_fwd
+    def forward(ctx, input_tensor, gt_grad):
+        ctx.save_for_backward(gt_grad)
+        # we return a dummy value 1, which will be scaled by amp's scaler so we get the scale in backward.
+        return torch.ones([1], device=input_tensor.device, dtype=input_tensor.dtype)
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_scale):
+        (gt_grad,) = ctx.saved_tensors
+        gt_grad = gt_grad * grad_scale
+        return gt_grad, None
 
 class SEEDTrainingWrapper(LightningModule):
     """Training wrapper for SEED
@@ -113,6 +132,13 @@ class SEEDTrainingWrapper(LightningModule):
         self.scheduler = self.image_tokenizer.diffusion_model.scheduler
         self.vae = self.image_tokenizer.diffusion_model.vae
 
+        # For SDS
+        t_range=[0.02, 0.98]
+        self.num_train_timesteps = 1000
+        self.min_step = int(self.num_train_timesteps * t_range[0])
+        self.max_step = int(self.num_train_timesteps * t_range[1])
+        self.alphas = self.image_noising_scheduler.alphas_cumprod  # for convenience
+
         # For logging
         self.sample_embed_ind = None
         self.pil_to_tensor = transforms.ToTensor()
@@ -140,7 +166,7 @@ class SEEDTrainingWrapper(LightningModule):
         for param in self.image_tokenizer.diffusion_model.unet.parameters():
             param.requires_grad = False
         for param in self.image_tokenizer.diffusion_model.vae.parameters():
-            param.requires_grad = False
+            param.requires_grad = True
 
         # For fp16
         if self.cfg.optimizer.fp16:
@@ -521,7 +547,7 @@ class SEEDTrainingWrapper(LightningModule):
         clip_size_image = self.transform_224(batch.img)
         # For cosine similarity logging
         gt_img_clip_embeddings = self.get_clip_img_embedding(clip_size_image.float())
-        image_embeds, _, _ = self.get_stage2_quant(clip_size_image)
+        image_embeds, _, _ = self.get_original_stage2_quant(clip_size_image)
 
         # Debug
         # self.image_tokenizer.diffusion_model(
@@ -533,86 +559,31 @@ class SEEDTrainingWrapper(LightningModule):
         #     latents=self.image_tokenizer.latents,
         # )
 
-        loss_diffusion = self.train_diffusion(
+        loss_sds = self.sds(
             image_embeds=image_embeds,
-            negative_image_embeds=None,
-            noise_level=0,
-            num_training_steps=1000,
-            latents=self.image_tokenizer.latents,
-            clean_image=batch.img,
+            clean_image=clip_size_image.float(),
+            guidance_scale=100,
+            grad_scale=1,
         )
 
-        # For logging
-        with torch.no_grad():
-            gt_loss_diffusion = self.train_diffusion(
-                image_embeds=gt_img_clip_embeddings,
-                negative_image_embeds=None,
-                noise_level=0,
-                num_training_steps=1000,
-                latents=self.image_tokenizer.latents,
-                clean_image=batch.img,
-            )
+        self.log(
+            "train/loss_sds",
+            loss_sds,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+        self.log(
+            "train/generation_embedding_clip_cosine_similarity",
+            F.cosine_similarity(image_embeds, gt_img_clip_embeddings).mean(),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
 
-        with torch.no_grad():
-            random_loss_diffusion = self.train_diffusion(
-                image_embeds=torch.randn_like(image_embeds),
-                negative_image_embeds=None,
-                noise_level=0,
-                num_training_steps=1000,
-                latents=self.image_tokenizer.latents,
-                clean_image=batch.img,
-            )
-
-        
-
-        if is_validation:
-            self.log(
-                "val/loss_diffusion",
-                loss_diffusion,
-                sync_dist=True,
-            )
-            # Cosine similarity logging
-            self.log(
-                "val/generation_embedding_clip_cosine_similarity",
-                F.cosine_similarity(image_embeds, gt_img_clip_embeddings).mean(),
-                sync_dist=True,
-            )
-
-        else:
-            self.log(
-                "train/loss_diffusion",
-                loss_diffusion,
-                on_step=True,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
-            self.log(
-                "train/gt_loss_diffusion",
-                gt_loss_diffusion,
-                on_step=True,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
-            self.log(
-                "train/random_loss_diffusion",
-                random_loss_diffusion,
-                on_step=True,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
-            self.log(
-                "train/generation_embedding_clip_cosine_similarity",
-                F.cosine_similarity(image_embeds, gt_img_clip_embeddings).mean(),
-                on_step=True,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
-
-        return loss_diffusion
+        return loss_sds
 
     def logging_train(self, quant, loss_embed, gt_img_clip_embeddings, loss):
         self.log(
@@ -641,6 +612,97 @@ class SEEDTrainingWrapper(LightningModule):
             prog_bar=True,
             logger=True,
         )
+    
+    def sds(
+        self,
+        image_embeds,
+        clean_image,
+        guidance_scale=100,
+        grad_scale=1,
+        prompt=None,
+        prompt_embeds=None,
+    ):
+        """Score distillation sampling"""
+        if prompt is None and prompt_embeds is None:
+            # prompt = len(image) * [""] if isinstance(image, list) else ""
+            # Changed because we get image_embeds as input
+            prompt = image_embeds.shape[0] * [""] if isinstance(image_embeds, torch.Tensor) else ""
+
+        # 2. Define call parameters
+        batch_size = image_embeds.shape[0]
+
+        device = image_embeds.device
+
+        # Convert images to latent space
+        latents = self.vae.encode(clean_image).latent_dist.sample()
+        latents = latents * self.vae.config.scaling_factor
+
+        
+         # 3. Encode input prompt
+       
+        # [b, 77, 1024] 
+        # Now img2img, prompt_embeds is None
+        prompt_embeds = self.image_tokenizer.diffusion_model._encode_prompt(
+            prompt=prompt,
+            device=device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=True,
+            negative_prompt=None,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=None,
+            lora_scale=None,
+        )
+
+        image_embeds = self.image_tokenizer.diffusion_model._encode_image(
+            image=None,
+            device=device,
+            batch_size=batch_size,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=True,
+            noise_level=0,
+            generator=None,
+            image_embeds=image_embeds,
+            negative_image_embeds=None,
+        )
+
+        # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
+        t = torch.randint(
+            self.min_step, self.max_step + 1, [1], dtype=torch.long, device=device
+        )
+
+        # predict the noise residual with unet, NO grad!
+        with torch.no_grad():
+            # add noise
+            noise = torch.randn_like(latents)
+            latents_noisy = self.scheduler.add_noise(latents, noise, t)
+            # pred noise
+            latent_model_input = torch.cat([latents_noisy] * 2)
+            noise_pred = self.unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=prompt_embeds,
+                class_labels=image_embeds,
+            ).sample
+
+        # perform guidance (high scale from paper!)
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+
+        noise_pred = noise_pred_uncond + guidance_scale * (
+            noise_pred_text - noise_pred_uncond
+        )
+
+        # w(t), sigma_t^2
+        self.alphas = self.alphas.to(device)
+        w = 1 - self.alphas[t]
+        grad = grad_scale * w * (noise_pred - noise)
+        grad = torch.nan_to_num(grad)
+
+        targets = (latents - grad).detach()
+        # loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='sum') / latents.shape[0]
+        # Why not mean?
+        loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='mean')
+
+        return loss
     
     def logging_val(self, quant, loss_embed, gt_img_clip_embeddings, loss):
         self.log(
@@ -674,7 +736,7 @@ class SEEDTrainingWrapper(LightningModule):
 
     def validation_step(self, batch, batch_idx: int):
         image = self.transform_224(batch.img)
-        image_embeds, _, _ = self.get_stage2_quant(image)
+        image_embeds, _, _ = self.get_original_stage2_quant(image)
 
         reconstructed_images = self.image_tokenizer.diffusion_model(
             image_embeds=image_embeds,
@@ -743,7 +805,7 @@ class SEEDTrainingWrapper(LightningModule):
         )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, betas=(0.9, 0.999), weight_decay=1e-8)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=3e-5, betas=(0.9, 0.999), weight_decay=1e-8)
         scheduler = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=100, num_training_steps=5000)
 
         lr_scheduler_config = {

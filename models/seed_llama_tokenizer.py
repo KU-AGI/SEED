@@ -6,7 +6,6 @@ import os
 # from timm.models import create_model
 from typing import Any, Dict, List, Optional, Union
 from transformers import LlamaTokenizer
-from diffusers import DiffusionPipeline
 # from torchvision.transforms.functional import pil_to_tensor
 
 # import torch
@@ -31,7 +30,7 @@ class ImageTokenizer(nn.Module):
                  image_size=224,
                  device='cuda',
                  fp16=True,
-                 from_pretrained=False,
+                 from_pretrained=True,
                  is_train=True,
                  **kwargs):
         super().__init__()

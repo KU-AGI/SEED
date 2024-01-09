@@ -54,7 +54,7 @@ NUM_IMG_TOKNES = 32
 NUM_IMG_CODES = 8192
 image_id_shift = 32000
 
-GENERATION_NUM = 30000
+GENERATION_NUM = 5000
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
@@ -133,7 +133,7 @@ class T2IEvalWrapper(LightningModule):
 
         self.generation_config = {
             'num_beams': 5,
-            'max_new_tokens': 512,
+            'max_new_tokens': 64,
             'do_sample': False
         }
 
@@ -188,23 +188,41 @@ class T2IEvalWrapper(LightningModule):
             return images
 
     def test_step(self, batch: Items, batch_idx: int):
+        # Debug
+        # self.tokenizer.encode_image(image_torch=batch.img)
+
         caption = ' '.join(batch.gt_txt[0])
         if batch.imgpath[0] in os.listdir(f"{self.cfg.result_file_path}"):
             print(f"Already generated {batch.imgpath[0]}")
             generated_image = Image.open(f"{self.cfg.result_file_path}/{batch.imgpath[0]}")
         else:
             # USER: {caption} Please generation an image.\nASSISTANT: {image}
-            prompt = "Please generation an image."
-            input_tokens = f"{self.tokenizer.bos_token} {self.s_token} {caption} {prompt} {self.sep} {self.e_token}"
-            try:
-                generate_ids = self.generate(self.tokenizer, input_tokens, self.generation_config, self.model)
-                generated_image = self.decode_image_text(generate_ids, self.tokenizer)
-                generated_image.save(f"{self.cfg.result_file_path}/{batch.imgpath[0]}")
-            except:
-                print(f"Error occured at {batch.imgpath[0]}")
-                with open(f"{self.cfg.result_file_path}/error.json", 'a') as f:
-                    json.dump({'imgpath': batch.imgpath[0], 'caption': caption}, f, indent='\t')
-                return
+            USE_I_VER = False
+            if USE_I_VER:
+                prompt = "Please generation an image."
+                input_tokens = f"{self.tokenizer.bos_token} {self.s_token} {caption} {prompt} {self.sep} {self.e_token}"
+                try:
+                    generate_ids = self.generate(self.tokenizer, input_tokens, self.generation_config, self.model)
+                    generated_image = self.decode_image_text(generate_ids, self.tokenizer)
+                    generated_image.save(f"{self.cfg.result_file_path}/{batch.imgpath[0]}")
+                except:
+                    print(f"Error occured at {batch.imgpath[0]}")
+                    with open(f"{self.cfg.result_file_path}/error.json", 'a') as f:
+                        json.dump({'imgpath': batch.imgpath[0], 'caption': caption}, f, indent='\t')
+                    return
+            else:
+                input_tokens = f"{self.tokenizer.bos_token} {caption} {BOI_TOKEN}"
+                try:
+                    generate_ids = self.generate(self.tokenizer, input_tokens, self.generation_config, self.model)
+                    # Force to use front 32 tokens
+                    image_ids = (generate_ids[:NUM_IMG_TOKNES]- image_id_shift).reshape(1,-1)
+                    generated_image = self.tokenizer.decode_image(image_ids)[0]
+                    generated_image.save(f"{self.cfg.result_file_path}/{batch.imgpath[0]}")
+                except:
+                    print(f"Error occured at {batch.imgpath[0]}")
+                    with open(f"{self.cfg.result_file_path}/error.json", 'a') as f:
+                        json.dump({'imgpath': batch.imgpath[0], 'caption': caption}, f, indent='\t')
+                    return
         
         rgb_image = generated_image.convert('RGB')
         rgb_image = rearrange(np.array(rgb_image), 'h w c -> 1 c h w')
@@ -235,12 +253,6 @@ if __name__ == "__main__":
     cfg, cfg_yaml = build_config()
     device = "cuda"
     os.makedirs(cfg.result_file_path, exist_ok=True)
-
-    cfg.dataset.eval_center_crop = True
-
-    cfg.dataset.name = 'coco2014'
-    cfg.dataset.type = 'mapstyle'
-    cfg.dataset.gt_text = True
 
     total_gpus = cfg.dist.n_gpus * cfg.dist.n_nodes
 

@@ -382,7 +382,7 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
             image_embeds=image_embeds,
             noise_level=noise_level,
             generator=generator,
-        )
+        ).to(dtype=dtype)
 
         # duplicate image embeddings for each generation per prompt, using mps friendly method
         image_embeds = image_embeds.unsqueeze(1)

@@ -1,7 +1,12 @@
 cfg_path: ???
-result_path: ???
-result_file_path: ???
-checkpoint_path: ???
+tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer.yaml
+transform_cfg_path: configs/transform/clip_transform.yaml
+model_cfg_path: configs/llm/seed_llama_8b_pretrain.yaml 
+result_path: none
+result_file_path: ./results/images/t2i_8b_pretrain_5000_test_for_failure
+checkpoint_path:
+  model_path: pretrained/seed_tokenizer/seed_quantizer.pt
+  diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
 eval: False
 resume: False
 finetune: False
@@ -14,7 +19,7 @@ dataset:
   type: mapstyle
   name: coco2014
   loc: bcloud
-  num_workers: 4
+  num_workers: 32
   shuffle: True
   tokenizer:
     type: ClipBPE
@@ -25,6 +30,8 @@ dataset:
     type: dalle-vqvae
     hparams:
       resolution: 256
+  gt_text: True
+  eval_center_crop: True
 
 stage1:
   ema_update: False
@@ -35,8 +42,8 @@ stage2:
 
 experiment:
   seed: 0
-  local_batch_size: 2
-  val_batch_size: 2
+  local_batch_size: 1
+  val_batch_size: 1
   test_split: train
 
 optimizer:
