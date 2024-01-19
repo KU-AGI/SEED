@@ -12,4 +12,5 @@ evaluation/*
 *.pth
 *.ckpt
 causal_embedding_test_images/*
+results/*
 ```
