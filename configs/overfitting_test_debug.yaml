@@ -40,14 +40,15 @@ stage2:
 
 experiment:
   seed: 0
-  local_batch_size: 1
-  val_batch_size: 1
+  local_batch_size: 2
+  val_batch_size: 2
   test_split: train
   max_epochs: 10000
   grad_accumulation: 1
   overfit_batches: 1
   # val_check_interval: 100
   check_val_every_n_epoch: 10
+  enable_checkpointing: False
 
 optimizer:
   fp16: False

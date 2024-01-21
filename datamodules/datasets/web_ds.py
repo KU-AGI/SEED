@@ -34,7 +34,8 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
              "it2it20m", "it2it20m_nc", "it2it120m",
              "signals17m", "it2it22m",
              "coco", "cc15m_vg_sbu", "cc15m_vg_sbu_kb100m", "cc15m_vg_sbu_signals17m",
-             "coco2014", "cc3m_coco", "mscoco"}
+             "coco2014", "cc3m_coco", "mscoco",
+             "cc3m_coco_laion_coco"}
     splits = {"train", "val"}
     locs = {"bcloud", "gcp"}
     urls_info = {
@@ -188,6 +189,15 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
         ("cc3m_coco", "bcloud", "val",): (
             "/ssd0/data/cc3m/{00321..00331}.tar",
         ),
+        # CC3M + COCO + LAION-COCO 10M
+        ("cc3m_coco_laion_coco", "bcloud", "train",): (
+            "/ssd0/data/cc3m/{00000..00331}.tar",
+            "/ssd0/data/mscoco/{00000..00059}.tar",
+            "/ssd0/data/laion-coco-final/{00000..62412}.tar" 
+        ),
+        ("cc3m_coco_laion_coco", "bcloud", "val",): (
+            "/ssd0/data/coco_karpathy/train/{00000..00056}.tar"
+        )
     }
 
     def __init__(
@@ -340,6 +350,12 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
             else:
                 # ret = 10000
                 ret = 2
+            return ret
+        elif name == 'cc3m_coco_laion_coco':
+            if split == "train":
+                ret = 3310000 + 414113 + 10000000
+            else:
+                ret = 560000 
             return ret
         else:
             raise ValueError()

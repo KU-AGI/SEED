@@ -214,11 +214,13 @@ class Blip2QformerQuantizer(Blip2Base):
         self.Qformer, self.query_tokens = self.init_Qformer(num_query_token, self.visual_encoder.num_features)
 
         self.Qformer.cls = None
-        self.Qformer.bert.embeddings.word_embeddings = None
-        self.Qformer.bert.embeddings.position_embeddings = None
-        for layer in self.Qformer.bert.encoder.layer:
-            layer.output = None
-            layer.intermediate = None
+        # word_embedding [30522, 768] to [30523, 768]
+        self.Qformer.bert.embeddings.word_embeddings = nn.Embedding(30523, self.Qformer.config.hidden_size)
+        # self.Qformer.bert.embeddings.word_embeddings = None
+        # self.Qformer.bert.embeddings.position_embeddings = None
+        # for layer in self.Qformer.bert.encoder.layer:
+        #     layer.output = None
+        #     layer.intermediate = None
 
         for name, param in self.Qformer.named_parameters():
             param.requires_grad = is_train
@@ -298,6 +300,11 @@ class Blip2QformerQuantizer(Blip2Base):
                 nn.Linear(128, 32, bias=False),
             )
             self.distill_image_proj = nn.Linear(num_query_token * 32, image_features_dim)
+
+        self.vision_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
+        self.text_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
+
+        self.temp = nn.Parameter(0.07 * torch.ones([]))
     
     def get_causal_embeddings(self, image):
         # Yes grad for training

@@ -715,9 +715,9 @@ if __name__ == "__main__":
         check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
         enable_checkpointing=True,
         # Debug
-        num_sanity_val_steps=1,
+        num_sanity_val_steps=2,
         # overfit_batches=cfg.experiment.overfit_batches,
-        callbacks=[ModelSummary(max_depth=1), lr_logger],
+        callbacks=[ModelSummary(max_depth=3), lr_logger],
         accumulate_grad_batches=cfg.experiment.grad_accumulation
     )
 
