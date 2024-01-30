@@ -34,7 +34,7 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
              "it2it20m", "it2it20m_nc", "it2it120m",
              "signals17m", "it2it22m",
              "coco", "cc15m_vg_sbu", "cc15m_vg_sbu_kb100m", "cc15m_vg_sbu_signals17m",
-             "coco2014", "cc3m_coco", "mscoco",
+             "coco2014", "cc3m_coco", "mscoco", "mscoco_debug",
              "cc3m_coco_laion_coco"}
     splits = {"train", "val"}
     locs = {"bcloud", "gcp"}
@@ -135,11 +135,18 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
         ("it2it22m", "bcloud", "val",): (
             "/data/public/rw/datasets/coco/wds_shards/val/2014/{000000..000404}.tar",
         ),
-        # coco
+        # mscoco
         ("mscoco", "bcloud", "train",): (
-            "/ssd0/data/mscoco/{00000..00001}.tar",
+            "/ssd0/data/mscoco/{00000..00059}.tar",
         ),
         ("mscoco", "bcloud", "val",): (
+            "/ssd0/data/mscoco/{00000..00059}.tar",
+        ),
+        # ms-coco debug
+        ("mscoco_debug", "bcloud", "train",): (
+            "/ssd0/data/mscoco/{00000..00001}.tar",
+        ),
+        ("mscoco_debug", "bcloud", "val",): (
             "/ssd0/data/mscoco/{00000..00001}.tar",
         ),
         # cc15m + VG + SBU
@@ -345,6 +352,12 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
             return ret
         elif name == 'mscoco':
             if split == "train":
+                ret = 591753  
+            else:
+                ret = 10000
+            return ret
+        elif name == 'mscoco_debug':
+            if split == "train":
                 # ret = 591753  
                 ret = 4
             else:
@@ -353,7 +366,8 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
             return ret
         elif name == 'cc3m_coco_laion_coco':
             if split == "train":
-                ret = 3310000 + 414113 + 10000000
+                #ret = 3310000 + 414113 + 10000000
+                ret = 1000000
             else:
                 ret = 560000 
             return ret

@@ -676,8 +676,12 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
         if prompt is None and prompt_embeds is None:
-            # prompt = len(image) * [""] if isinstance(image, list) else ""
-            prompt = image_embeds.shape[0] * [""] if isinstance(image_embeds, torch.Tensor) else ""
+            if image_embeds is not None:
+                prompt = image_embeds.shape[0] * [""] if isinstance(image_embeds, torch.Tensor) else ""
+            elif isinstance(image, list) or isinstance(image, torch.Tensor):
+                prompt = len(image) * [""]
+            else:
+                prompt = ""
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(

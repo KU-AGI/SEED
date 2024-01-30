@@ -115,6 +115,23 @@ class SEEDTrainingWrapper(LightningModule):
         self.pil_to_tensor = transforms.ToTensor()
         self.sample_image_ind = 0
         self.logged_original_image = set()
+        
+        self.stage = 2
+    
+    def random_initialize_stage2_model_weights(self):
+        """Random initialize stage 2 model weights
+        """        
+        # Random initialize stage 2 model weights
+        for param in self.image_tokenizer.model.parameters():
+            param.requires_grad = False
+
+        # For fp16
+        if self.cfg.optimizer.fp16:
+            self.image_tokenizer = self.image_tokenizer.half()
+            self.image_encoder = self.image_encoder.half()
+            self.embedding_proj = self.embedding_proj.half()
+            for blk in self.embedding_block:
+                blk = blk.half()
 
     def setup(self, stage):
         # Setup training parameter
@@ -138,6 +155,32 @@ class SEEDTrainingWrapper(LightningModule):
             param.requires_grad = False
         for param in self.image_tokenizer.diffusion_model.vae.parameters():
             param.requires_grad = False
+            
+        if self.stage == 2:
+            for param in self.image_tokenizer.model.parameters():
+                param.requires_grad = False
+                
+            # unFreeze stage 2 model and initialize with random weights
+            for param in self.image_tokenizer.model.encode_task_layer.parameters():
+                #nn.init.xavier_uniform_(param) 
+                nn.init.normal_(param, mean=0.0, std=0.02)              
+                param.requires_grad = True 
+            for param in self.image_tokenizer.model.quantize.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                param.requires_grad = True
+            for param in self.image_tokenizer.model.decode_task_layer.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                param.requires_grad = True
+            for param in self.image_tokenizer.model.blocks_image.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                param.requires_grad = True
+            for param in self.image_tokenizer.model.image_down.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                param.requires_grad = True
+            for param in self.image_tokenizer.model.distill_image_proj.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                param.requires_grad = True
+            
 
         # For fp16
         if self.cfg.optimizer.fp16:
@@ -247,7 +290,6 @@ class SEEDTrainingWrapper(LightningModule):
         #------------------------
         # Stage 2 - 3 : Reconstruction Generation Embedding
         #------------------------
-
         # MLP
         reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
 
@@ -512,12 +554,17 @@ class SEEDTrainingWrapper(LightningModule):
     
     def training_step(self, batch, batch_idx: int):
         self.B = batch.img.shape[0]
+        
         # gt_text is a list of string
         # Encoding text in list to ascii
         #batch.gt_txt = [[text[0].encode("ascii", "ignore").decode()] for text in batch.gt_txt]
 
         #stage_1_loss = self.get_stage_1_loss(batch, batch_idx)
+        
         stage_2_loss = self.get_stage_2_loss(batch, batch_idx)
+        
+        # mock loss 1
+        #stage_2_loss = torch.tensor(0.1979, requires_grad=True)
 
         #return stage_1_loss
         return stage_2_loss
@@ -663,6 +710,13 @@ if __name__ == "__main__":
 
     datamodule.setup()
     train_dataloader = datamodule.train_dataloader()
+    #train_dataloader = torch.utils.data.DataLoader(
+    #    torch.zeros((cfg.experiment.local_batch_size, 3, 224, 224)),
+    #    batch_size=cfg.experiment.local_batch_size,
+    #    num_workers=4,
+    #    pin_memory=False,
+    #    shuffle=True,
+    #)
     val_dataloader = datamodule.val_dataloader()
 
     tb_logger = pl_loggers.TensorBoardLogger(save_dir=cfg.result_file_path)
@@ -684,8 +738,9 @@ if __name__ == "__main__":
         logger=tb_logger,
         log_every_n_steps=1,
         # val_check_interval=cfg.experiment.val_check_interval,
-        check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
-        enable_checkpointing=cfg.experiment.enable_checkpointing,
+        # check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
+        # enable_checkpointing=cfg.experiment.enable_checkpointing,
+        enable_checkpointing=True,
         # Debug
         num_sanity_val_steps=0,
         precision='bf16',

@@ -440,6 +440,11 @@ class SEEDTrainingWrapper(LightningModule):
 
         loss_total = loss_embed - loss_recon + loss_generation_embed
         loss_total = loss_total.mean()
+        
+        print(f"loss_embed : {loss_embed.mean()}")
+        print(f"loss_recon : {loss_recon.mean()}")
+        print(f"loss_generation_embed : {loss_generation_embed.mean()}")
+        print(f"loss_total : {loss_total.mean()}")
 
         loss_dict = {"loss_embed": loss_embed, "loss_recon": loss_recon,
                 "loss_generation_embed": loss_generation_embed,
@@ -518,6 +523,9 @@ class SEEDTrainingWrapper(LightningModule):
 
         #stage_1_loss = self.get_stage_1_loss(batch, batch_idx)
         stage_2_loss = self.get_stage_2_loss(batch, batch_idx)
+        
+        #make mook loss
+        #stage_2_loss = torch.tensor(0.1979, requires_grad=True)
 
         #return stage_1_loss
         return stage_2_loss
@@ -688,9 +696,9 @@ if __name__ == "__main__":
         enable_checkpointing=cfg.experiment.enable_checkpointing,
         # Debug
         num_sanity_val_steps=0,
-        precision='bf16',
         # overfit_batches=cfg.experiment.overfit_batches,
         callbacks=[ModelSummary(max_depth=3), lr_logger],
+        precision='bf16',
         accumulate_grad_batches=cfg.experiment.grad_accumulation
     )
 

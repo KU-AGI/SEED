@@ -39,7 +39,8 @@ class ImageTokenizer(nn.Module):
             model = Blip2QformerQuantizer(vit_precision='fp16' if fp16 else 'fp32', is_train=True, **kwargs)
         else:
             model = Blip2QformerQuantizer.from_pretrained(pretrained_model_path=model_path,
-                                                        vit_precision='fp16' if fp16 else 'fp32',
+                                                        #vit_precision='fp16' if fp16 else 'fp32',
+                                                        vit_precision='bf16',
                                                         is_train=True,
                                                         **kwargs)#.eval()
 
@@ -47,7 +48,8 @@ class ImageTokenizer(nn.Module):
             # diffusion_model = DiffusionPipeline.from_pretrained(diffusion_model_path,
             #                                                     torch_dtype=torch.float16 if fp16 else torch.float32)
             diffusion_model = StableUnCLIPImg2ImgPipeline.from_pretrained(diffusion_model_path,
-                                                                          torch_dtype=torch.float16 if fp16 else torch.float32)
+                                                                          #torch_dtype=torch.float16 if fp16 else torch.float32
+                                                                          torch_dtype=torch.bfloat16)
         else:
             self.diffusion_model = None
 
@@ -67,10 +69,10 @@ class ImageTokenizer(nn.Module):
             model = model.half()
 
         shape_latents = torch.Size([1, 4, 96, 96])
-        self.latents = torch.randn(shape_latents, generator=None, device=device, dtype=torch.float16, layout=torch.strided)
+        self.latents = torch.randn(shape_latents, generator=None, device=device, dtype=torch.bfloat16, layout=torch.strided)
 
         shape_noise = torch.Size([1, 1024])
-        self.noise = torch.randn(shape_noise, generator=None, device=device, dtype=torch.float16, layout=torch.strided)
+        self.noise = torch.randn(shape_noise, generator=None, device=device, dtype=torch.bfloat16, layout=torch.strided)
 
         self.model = model
         if diffusion_model is not None:

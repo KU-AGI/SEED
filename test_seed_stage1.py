@@ -64,6 +64,43 @@ image_id_shift = 32000
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
+def drop_randomly(x, drop_prob):
+    """_summary_
+        Get Tensor x, and randomly drop some of them
+        according to drop_prob
+    Args:
+        x (torch.Tensor): [b, 32] shape Tensor
+        drop_prob (float): Probability of dropping
+    
+    Returns:
+        torch.Tensor: [b, 32] shape Tensor
+    """    
+    keep = torch.rand(x.shape[0], x.shape[1], device=x.device) > drop_prob
+    return x * keep
+
+def change_randomly(x, change_prob):
+    """_summary_
+        Get Tensor x, and randomly change some of them
+        image codes are 0 to 8191, so randomly change
+        according to change_prob
+    Args:
+        x (torch.Tensor): [b, 32] shape Tensor
+        change_prob (float): Probability of changing 
+
+    Returns:
+        torch.Tensor: [b, 32] shape Tensor
+    """    
+
+    # Create a mask with the same shape as x, with True values where changes should happen
+    change_mask = torch.rand_like(x, dtype=torch.float32) < change_prob
+
+    # Generate random values for each element in the tensor, in the range [0, 8191]
+    random_values = torch.randint(0, 8192, x.shape, device=x.device)
+
+    # Use the mask to replace elements in x with the random values
+    x = torch.where(change_mask, random_values, x)
+
+    return x
 
 class SEEDTestWrapper(LightningModule):
     """Test wrapper for SEED
@@ -272,58 +309,61 @@ class SEEDTestWrapper(LightningModule):
             batch (_type_): _description_
             batch_idx (int): _description_
         """
-        image_save_root = "causal_embedding_test_images"
+        mode = "change"
+        save_root = "causal_embedding_test_images"
+        image_save_root = f"{save_root}/{mode}_test_1"
+        os.makedirs(image_save_root, exist_ok=True)
 
         image = batch.img.to(self.device)
 
+        # Save Original Image
+        save_image(image, f"{image_save_root}/original_image.png")
+
+        # Get Image Tokens, Save Reconstructed Image
         indicies = self.image_tokenizer.encode(
             image_torch=image
         )
 
-        '''
-        save_image(
-            image, f"{image_save_root}/original.png"
+        reconstructed_image = self.image_tokenizer.decode(
+            indicies
         )
-        '''
+        reconstructed_image[0].save(
+            f"{image_save_root}/reconstructed_image.png"
+        )
 
-        # PIL image
-        '''
-        with torch.no_grad():
-            reconstructed_images = self.image_tokenizer.decode(
-                indicies[0].unsqueeze(0)
-            )
+        json_path = f"{image_save_root}/image_tokens.json"
+        indicies_dict = {
+            "original_image_tokens": indicies.tolist()
+        }
+
+        # Accoding to drop_prob, drop some of tokens
+        for prob in [0.1, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9]:
+            save_path = f"{mode}_{prob}"
+            os.makedirs(f"{image_save_root}/{save_path}", exist_ok=True)
+
+            # Save 10 images for each drop_prob
+            indicies_dict[f"{mode}_{prob}"] = []
+            for index in range(10):
+                if mode == "drop":
+                    new_indicies = drop_randomly(indicies, prob)
+                elif mode == "change":
+                    new_indicies = change_randomly(indicies, prob)
+                else:
+                    raise NotImplementedError(f"{mode} is not implemented")
+                    exit()
+
+                image = self.image_tokenizer.decode(
+                    new_indicies
+                )
+                image[0].save(
+                    f"{image_save_root}/{save_path}/image_{index}.png"
+                )
+                indicies_dict[f"{mode}_{prob}"].append(new_indicies.tolist())
+            
         
-        reconstructed_images[0].save(
-            f"{image_save_root}/reconstructed.png"
-        )
-        '''
-        save_path = "fron_back_exchange"
-        # os.makedirs(f"{image_save_root}/{save_path}", exist_ok=True)
-
-        new_indicies = torch.cat((indicies[0][16:], indicies[0][:16]), dim=0)
-        image = self.image_tokenizer.decode(
-            new_indicies.unsqueeze(0)
-        )
-        image[0].save(
-            f"{image_save_root}/{save_path}.png"
-        )
-
-        '''
-        for i in tqdm(range(50)):
-            perm = torch.randperm(indicies.size(1) - 16) + 16
-
-            # Concatenate the first 16 indices (fixed) with the permuted indices
-            indicies_perm = torch.cat((indicies[0][:16], indicies[0][perm]), dim=0)
-
-            permuted_image = self.image_tokenizer.decode(
-                indicies_perm.unsqueeze(0)
-            )
-
-            permuted_image[0].save(
-                f"{image_save_root}/{save_path}/fix16_permutation_{i}.png"
-            )
-        '''
-
+        with open(json_path, "w") as f:
+            json.dump(indicies_dict, f)
+        exit()
         return
 
 if __name__ == "__main__":
@@ -336,12 +376,14 @@ if __name__ == "__main__":
     transform_cfg = OmegaConf.load(cfg.transform_cfg_path)
     transform = hydra.utils.instantiate(transform_cfg)
 
+    '''
     transform = transforms.Compose(
         [
             transforms.Resize(224, antialias=True),
             transforms.ToTensor(),
         ]
     )
+    '''
 
     # Set up datamodule
     datamodule = build_datamodule(
@@ -361,8 +403,8 @@ if __name__ == "__main__":
         num_nodes=cfg.dist.n_nodes,
         devices=cfg.dist.n_gpus,
         strategy="ddp",
-        max_epochs=100,
-        enable_checkpointing=False,
+        max_epochs=cfg.experiment.max_epochs,
+        enable_checkpointing=cfg.experiment.enable_checkpointing,
         enable_model_summary=False,
         deterministic=True,
     )

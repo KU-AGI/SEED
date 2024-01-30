@@ -28,7 +28,7 @@ IMG_TOKEN = '<img_{:05d}>'
 IMG_FLAG = '<image>'
 NUM_IMG_TOKNES = 32
 NUM_IMG_CODES = 8192
-image_id_shift = 32000
+IMAGE_ID_SHIFT = 32000
 
 def generate(tokenizer, input_tokens, generation_config, model):
 
@@ -62,7 +62,7 @@ def decode_image_text(generate_ids, tokenizer, save_path=None):
             texts = tokenizer.decode(text_ids, skip_special_tokens=True)
             print(texts)
             
-        image_ids = (generate_ids[boi_index+1:eoi_index] - image_id_shift).reshape(1,-1)
+        image_ids = (generate_ids[boi_index+1:eoi_index] - IMAGE_ID_SHIFT).reshape(1,-1)
 
         images = tokenizer.decode_image(image_ids)
 

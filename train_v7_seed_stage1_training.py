@@ -115,6 +115,23 @@ class SEEDTrainingWrapper(LightningModule):
         self.pil_to_tensor = transforms.ToTensor()
         self.sample_image_ind = 0
         self.logged_original_image = set()
+        
+        self.stage = 1
+    
+    def random_initialize_stage2_model_weights(self):
+        """Random initialize stage 2 model weights
+        """        
+        # Random initialize stage 2 model weights
+        for param in self.image_tokenizer.model.parameters():
+            param.requires_grad = False
+
+        # For fp16
+        if self.cfg.optimizer.fp16:
+            self.image_tokenizer = self.image_tokenizer.half()
+            self.image_encoder = self.image_encoder.half()
+            self.embedding_proj = self.embedding_proj.half()
+            for blk in self.embedding_block:
+                blk = blk.half()
 
     def setup(self, stage):
         # Setup training parameter
@@ -138,6 +155,32 @@ class SEEDTrainingWrapper(LightningModule):
             param.requires_grad = False
         for param in self.image_tokenizer.diffusion_model.vae.parameters():
             param.requires_grad = False
+            
+        if self.stage == 2:
+            for param in self.image_tokenizer.model.parameters():
+                param.requires_grad = False
+                
+            # unFreeze stage 2 model and initialize with random weights
+            for param in self.image_tokenizer.model.encode_task_layer.parameters():
+                #nn.init.xavier_uniform_(param) 
+                nn.init.normal_(param, mean=0.0, std=0.02)              
+                param.requires_grad = True 
+            for param in self.image_tokenizer.model.quantize.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                param.requires_grad = True
+            for param in self.image_tokenizer.model.decode_task_layer.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                param.requires_grad = True
+            for param in self.image_tokenizer.model.blocks_image.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                param.requires_grad = True
+            for param in self.image_tokenizer.model.image_down.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                param.requires_grad = True
+            for param in self.image_tokenizer.model.distill_image_proj.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                param.requires_grad = True
+            
 
         # For fp16
         if self.cfg.optimizer.fp16:
@@ -247,12 +290,10 @@ class SEEDTrainingWrapper(LightningModule):
         #------------------------
         # Stage 2 - 3 : Reconstruction Generation Embedding
         #------------------------
-
         # MLP
         reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
 
         return reverse_output_proj, loss_embed, embed_ind
-
 
     def get_stage_1_loss(self, batch, batch_idx: int, is_validation=False):
         """_summary_
@@ -262,8 +303,9 @@ class SEEDTrainingWrapper(LightningModule):
             batch_idx (int): _description_
             is_validation (bool, optional): _description_. Defaults to False.
         """
-        device = batch.img.device
-        image = self.transform_224(batch.img)
+        # image = self.transform_224(batch.img)
+        device = self.device
+        image = batch.img.to(device)
         text = [text[0].encode("ascii", "ignore").decode() for text in batch.gt_txt]
         with torch.no_grad():
             image_embeds = self.image_tokenizer.model.ln_vision(
@@ -281,10 +323,10 @@ class SEEDTrainingWrapper(LightningModule):
             return_dict=True,
         )
 
-        image_feats = F.normalize(
-            self.image_tokenizer.model.vision_proj(
-                query_output.last_hidden_state), dim=-1
-        )
+        # Use last hidden state
+        # We have 32 tokens, and use last token as image embedding
+        # [b, 768]
+        image_feats = F.normalize(query_output.last_hidden_state[:, -1, :], dim=1)
 
         text_tokens = self.image_tokenizer.model.tokenizer(
             text,
@@ -292,45 +334,29 @@ class SEEDTrainingWrapper(LightningModule):
             truncation=True,
             max_length=128,
             return_tensors="pt",
-        ).to(device)
+        )
 
         text_output = self.image_tokenizer.model.Qformer.bert(
-            text_tokens.input_ids,
-            attention_mask=text_tokens.attention_mask,
+            text_tokens.input_ids.to(device),
+            attention_mask=text_tokens.attention_mask.to(device),
             return_dict=True,
         )
 
-        text_feat = F.normalize(
-            self.image_tokenizer.model.text_proj(
-                text_output.last_hidden_state[:, 0, :]), dim=-1
-        )
+        # CLS token
+        # [b, 768]
+        text_feats = F.normalize(text_output.last_hidden_state[:, 0, :], dim=1)
 
         ###============== Image-text Contrastive ===================###
-        sim_q2t = torch.matmul(
-            image_feats.unsqueeze(1), text_feat.unsqueeze(-1)
+        # image_feats : [b, 768]
+        # text_feat : [b, 768] => [768, b]
+        sim_i2t = torch.matmul(
+            image_feats, text_feats.T
         ).squeeze()
-        # [batch_size, batch_size*num_gpu, num_query_tokens]
-
-        # image-text similarity: aggregate across all query tokens
-        sim_i2t, _ = sim_q2t.max(-1)
-        sim_i2t = sim_i2t / self.image_tokenizer.model.temp
-
-        # text-query similarity: [batch_size, batch_size*num_gpu, num_query_tokens]
-        sim_t2q = torch.matmul(
-            text_feat.unsqueeze(1).unsqueeze(1), image_feats.permute(0, 2, 1)
-        ).squeeze()
-
-        # text-image similarity: aggregate across all query tokens
-        sim_t2i, _ = sim_t2q.max(-1)
-        sim_t2i = sim_t2i / self.image_tokenizer.model.temp  # [batch_size, batch_size*num_gpu]
 
         bs = image.size(0)
         targets = torch.arange(bs, dtype=torch.long).to(device)
 
-        loss_itc = (
-            F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
-            + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
-        ) / 2
+        loss_itc = F.cross_entropy(sim_i2t, targets)
 
         self.log(
                 "train/loss_itc",
@@ -516,11 +542,11 @@ class SEEDTrainingWrapper(LightningModule):
         # Encoding text in list to ascii
         #batch.gt_txt = [[text[0].encode("ascii", "ignore").decode()] for text in batch.gt_txt]
 
-        #stage_1_loss = self.get_stage_1_loss(batch, batch_idx)
-        stage_2_loss = self.get_stage_2_loss(batch, batch_idx)
+        stage_1_loss = self.get_stage_1_loss(batch, batch_idx)
+        # stage_2_loss = self.get_stage_2_loss(batch, batch_idx)
 
         #return stage_1_loss
-        return stage_2_loss
+        return stage_1_loss
 
     def validation_step(self, batch, batch_idx: int):
         image = self.transform_224(batch.img)

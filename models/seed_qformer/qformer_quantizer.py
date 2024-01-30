@@ -178,7 +178,7 @@ class Blip2QformerQuantizer(Blip2Base):
                  use_recon_s_for_image=False,
                  use_qformer_image=False,
                  image_features_dim=1024,
-                 is_train=False,):
+                 is_train=True,):
         super().__init__()
 
         self.tokenizer = self.init_tokenizer()
@@ -300,16 +300,12 @@ class Blip2QformerQuantizer(Blip2Base):
                 nn.Linear(128, 32, bias=False),
             )
             self.distill_image_proj = nn.Linear(num_query_token * 32, image_features_dim)
-
-        self.vision_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
-        self.text_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
-
-        self.temp = nn.Parameter(0.07 * torch.ones([]))
     
     def get_causal_embeddings(self, image):
         # Yes grad for training
         # with torch.no_grad():
         with self.maybe_autocast():
+        #with torch.no_grad():
             # [b, 257, 1408]
             image_embeds = self.ln_vision(self.visual_encoder(image))
             # [b, 256]
@@ -436,3 +432,32 @@ class Blip2QformerQuantizer(Blip2Base):
         missing, unexcepted = model.load_state_dict(ckpt, strict=False)
         print('missing keys: ', len(missing), 'unexpected keys:', len(unexcepted))
         return model
+
+    @classmethod
+    def from_pretrained_debug(cls, pretrained_model_path, **kwargs):
+        vit_model = kwargs.get("vit_model", "eva_clip_g")
+        img_size = kwargs.get("image_size", 224)
+        num_query_token = kwargs.get("num_query_token", 32)
+        cross_attention_freq = kwargs.get("cross_attention_freq", 2)
+
+        drop_path_rate = kwargs.get("drop_path_rate", 0)
+        use_grad_checkpoint = kwargs.get("use_grad_checkpoint", False)
+        vit_precision = kwargs.get("vit_precision", "fp16")
+        freeze_vit = kwargs.get("freeze_vit", True)
+
+        max_txt_len = kwargs.get("max_txt_len", 32)
+
+        model = cls(
+            vit_model=vit_model,
+            img_size=img_size,
+            drop_path_rate=drop_path_rate,
+            use_grad_checkpoint=use_grad_checkpoint,
+            vit_precision=vit_precision,
+            freeze_vit=freeze_vit,
+            num_query_token=num_query_token,
+            cross_attention_freq=cross_attention_freq,
+            max_txt_len=max_txt_len,
+        )
+
+        return model
+    
