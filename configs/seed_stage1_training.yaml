@@ -2,8 +2,8 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_path: /ssd0/checkpoints/seed_tokenizer/seed_training_proj_and_transformer
-result_file_path: ./logs/seed_stage2_proj
+result_path: none
+result_file_path: ./logs/seed_stage_1_training
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
@@ -12,19 +12,19 @@ resume: False
 finetune: False
 
 dist:
-  n_gpus: 4
+  n_gpus: 2
   n_nodes: 1
 
 dataset:
   type: webdataset
   name: cc3m_coco_laion_coco
   loc: bcloud
-  num_workers: 4
+  num_workers: 32 
   shuffle: True
   tokenizer:
     type: ClipBPE
     hparams:
-      context_length: 64
+      context_length: 512
       bpe_pdrop: 0.1
   transform:
     type: dalle-vqvae
@@ -40,16 +40,17 @@ stage2:
 
 experiment:
   seed: 0
-  local_batch_size: 1024
-  
-  val_batch_size: 1
+  local_batch_size: 512
+  val_batch_size: 32
   test_split: train
-  max_epochs: 20
+  max_epochs: 10
   grad_accumulation: 1
-  val_check_interval: 1
-  check_val_every_n_epoch: 1
+  # overfit_batches: 1
+  val_check_interval: 100
+  # check_val_every_n_epoch: 10
   enable_checkpointing: True
 
 optimizer:
   fp16: False
+  bf16: True
   grad_clip_val: 0.5

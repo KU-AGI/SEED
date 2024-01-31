@@ -70,13 +70,12 @@ class SEEDTrainingWrapper(LightningModule):
     Args:
         LightningModule (cfg, model): model should be ImageTokenizer
     """    
-    def __init__(self, cfg, checkpoint_path=None, validation_image_folder=None):
+    def __init__(self, cfg, validation_image_folder=None):
         super().__init__()
         self.cfg = cfg
         self.validation_image_folder = validation_image_folder
         # ImageTokenizer model
         # Target model to train
-        
         self.image_tokenizer = ImageTokenizer(model_path=cfg.checkpoint_path.model_path,
                             fp16=cfg.optimizer.fp16,
                             from_pretrained=True,
@@ -177,12 +176,15 @@ class SEEDTrainingWrapper(LightningModule):
             #     nn.init.normal_(param, mean=0.0, std=0.02)
             #     param.requires_grad = True
             
-            for param in self.image_tokenizer.model.blocks_image.parameters():
-                param.requires_grad = True
+            # for param in self.image_tokenizer.model.blocks_image.parameters():
+            #     nn.init.normal_(param, mean=0.0, std=0.02)
+            #     param.requires_grad = True
             
             for param in self.image_tokenizer.model.image_down.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
                 param.requires_grad = True
             for param in self.image_tokenizer.model.distill_image_proj.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
                 param.requires_grad = True
             
         ## make dump folder
@@ -273,10 +275,10 @@ class SEEDTrainingWrapper(LightningModule):
             loss_embed = None
             embed_ind = None
             
-            query_output_up = causal_embeddings
-            query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
+            # query_output_up = causal_embeddings
+            # query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
             
-            quant = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
+            quant = self.image_tokenizer.model.get_mlp_decoded_embedding(causal_embeddings)
 
             return quant, loss_embed, embed_ind
 
@@ -500,25 +502,22 @@ class SEEDTrainingWrapper(LightningModule):
         query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
         '''        
 
-        query_output_up = causal_embeddings
-        # Transformer decoder
-        query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
+        # # Transformer decoder
+        # query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
         
         
 
-        # query_output_up_pos_image should be similar to original causal_embeddings
-        # Maximize cosine similarity between query_output_up_pos_image and causal_embeddings
+        # # query_output_up_pos_image should be similar to original causal_embeddings
+        # # Maximize cosine similarity between query_output_up_pos_image and causal_embeddings
 
-        loss_recon = F.cosine_similarity(query_output_up, causal_embeddings).mean()
-        
-        
+        # loss_recon = F.cosine_similarity(query_output_up, causal_embeddings).mean()
         
         #------------------------
         # Stage 2 - 3 : Reconstruction Generation Embedding
         #------------------------
 
         # MLP
-        # query_output_up = causal_embeddings
+        query_output_up = causal_embeddings
         reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
 
         gt_img_clip_embeddings = self.get_clip_img_embedding(img)
@@ -664,6 +663,7 @@ class SEEDTrainingWrapper(LightningModule):
         
     def on_validation_epoch_end(self):
         original_image_dir = '/ssd0/data/coco/images/val2014'
+        
         if self.validation_image_folder is None:
             generated_image_dir = f"{self.cfg.result_path}/{self.current_epoch}"
         else:
@@ -697,11 +697,24 @@ if __name__ == "__main__":
     transform = hydra.utils.instantiate(transform_cfg)
 
     os.makedirs(cfg.result_file_path, exist_ok=True)
+
+    datamodule = build_datamodule(
+        cfg=cfg,
+        train_transform=transform,
+        val_transform=transform,
+        pin_memory=False,
+        epoch=cfg.experiment.max_epochs,
+        total_gpus=cfg.dist.n_gpus,
+    )
+
+    datamodule.setup()
+    train_dataloader = datamodule.train_dataloader()
+    #val_dataloader = datamodule.val_dataloader()
     
     karpathy_file = '/ssd0/data/coco/annotations/karpathy/dataset_coco_test.json'
     root_dir = '/ssd0/data/coco/images/val2014'
     start_index = 0
-    end_index = None
+    end_index = 256
     val_dataset = CocoDataset(root_dir, karpathy_file, tokenizer=None, start_index=start_index, end_index=end_index)
     val_dataloader = DataLoader(val_dataset, batch_size=1, collate_fn=val_dataset.collate_fn, num_workers=4)
 
@@ -719,7 +732,7 @@ if __name__ == "__main__":
             # else None,
         ),
         #strategy="ddp",
-        max_epochs=1,
+        max_epochs=cfg.experiment.max_epochs,
         deterministic=True,
         logger=tb_logger,
         log_every_n_steps=1,
@@ -732,14 +745,13 @@ if __name__ == "__main__":
         precision='bf16',
         # overfit_batches=cfg.experiment.overfit_batches,
         callbacks=[ModelSummary(max_depth=3), lr_logger],
-        accumulate_grad_batches=cfg.experiment.grad_accumulation,
+        accumulate_grad_batches=cfg.experiment.grad_accumulation
     )
 
-    checkpoint_path = '/home/zheedong/Projects/SEED/logs/seed_stage2_proj/lightning_logs/projection_and_decoder/checkpoints/epoch=9-step=1960.ckpt'
-    validation_image_folder = '/ssd0/checkpoints/seed_tokenizer/results/proj_and_decoder'
-    #wrapper = SEEDTrainingWrapper(cfg, checkpoint_path=checkpoint_path, validation_image_folder=validation_image_folder).to(device)
-    wrapper = SEEDTrainingWrapper.load_from_checkpoint(checkpoint_path, cfg=cfg, validation_image_folder=validation_image_folder).to(device)
+    wrapper = SEEDTrainingWrapper(cfg).to(device)
     wrapper.setup("fit")
 
-    trainer.validate(wrapper, val_dataloader)
+    trainer.fit(
+        wrapper, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader,
+    )
     trainer.strategy.barrier()

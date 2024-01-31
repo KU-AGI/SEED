@@ -9,7 +9,7 @@
             "type": "python",
             "request": "launch",
             "program": "${file}",
-            "env": {"CUDA_VISIBLE_DEVICES":"5"},
+            "env": {"CUDA_VISIBLE_DEVICES":"5, 9"},
             "args" : ["cfg_path=configs/seed_training_debug.yaml"],
             // "args" : ["--image_save_path=seed_llama_I_text2img_generation_DCI_Short_Caption", "--use_short_or_long=short"],
             "console": "integratedTerminal",

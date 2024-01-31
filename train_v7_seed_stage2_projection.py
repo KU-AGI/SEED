@@ -251,31 +251,35 @@ class SEEDTrainingWrapper(LightningModule):
 
     def get_stage2_quant(self, img):
         # Causal embedding is trained in stage 1.
-        causal_embeddings = self.get_causal_embeddings(img)
+        with torch.no_grad():
+            causal_embeddings = self.get_causal_embeddings(img)
 
-        '''
-        # [b, 32, 32]
-        query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
+            '''
+            # [b, 32, 32]
+            query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
 
-        # For debug
-        quant = query_output_down
-        loss_embed = None
-        embed_ind = None
+            # For debug
+            quant = query_output_down
+            loss_embed = None
+            embed_ind = None
 
-        # Simple flatten and linear projection
-        # Debug : Try to use transformer
-        # for blk in self.embedding_block:
-        #     quant = blk(quant)
-        quant = quant.view(quant.shape[0], -1)
-        quant = self.embedding_proj(quant)
-        '''
-        quant = None
-        loss_embed = None
-        embed_ind = None
-        
-        quant = self.image_tokenizer.model.get_mlp_decoded_embedding(causal_embeddings)
+            # Simple flatten and linear projection
+            # Debug : Try to use transformer
+            # for blk in self.embedding_block:
+            #     quant = blk(quant)
+            quant = quant.view(quant.shape[0], -1)
+            quant = self.embedding_proj(quant)
+            '''
+            quant = None
+            loss_embed = None
+            embed_ind = None
+            
+            query_output_up = causal_embeddings
+            query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
+            
+            quant = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
 
-        return quant, loss_embed, embed_ind
+            return quant, loss_embed, embed_ind
 
     def get_original_stage2_quant(self, img):
         causal_embeddings = self.get_causal_embeddings(img)
@@ -617,7 +621,7 @@ class SEEDTrainingWrapper(LightningModule):
         return stage_2_loss
 
     @torch.no_grad()
-    def validation_step(self, batch, batch_idx: int):
+    def validation_step(self, batch, batch_idx: int, save_path=None):
         image, captions, image_id = batch
         #image = self.transform_224(batch.img)
         image_embeds, _, _ = self.get_stage2_quant(image)
@@ -632,8 +636,9 @@ class SEEDTrainingWrapper(LightningModule):
             ).images
             
             # save image
-            print(batch_idx)
-            reconstructed_images[0].save(f"{self.cfg.result_path}/{self.current_epoch}/{image_id[0]}")
+            if save_path is None:
+                save_path = f"{self.cfg.result_path}/{self.current_epoch}"
+            reconstructed_images[0].save(f"{save_path}/{image_id[0]}")
 
             # tensor_images = []
             # for img in reconstructed_images:

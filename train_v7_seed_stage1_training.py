@@ -47,6 +47,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 from PIL import Image
+from einops import rearrange
 import pdb
 
 
@@ -77,6 +78,7 @@ class SEEDTrainingWrapper(LightningModule):
                             from_pretrained=True,
                             diffusion_model_path=cfg.checkpoint_path.diffusion_model_path,
                             load_diffusion=True,
+                            is_train_stage_1=True,
                             )
 
         self.B = None
@@ -315,6 +317,8 @@ class SEEDTrainingWrapper(LightningModule):
 
         query_tokens = self.image_tokenizer.model.query_tokens.expand(image_embeds.shape[0], -1, -1)
 
+        # Bidirectional cross attention
+        '''
         query_output = self.image_tokenizer.model.Qformer.bert(
             query_embeds=query_tokens,
             encoder_hidden_states=image_embeds,
@@ -322,11 +326,31 @@ class SEEDTrainingWrapper(LightningModule):
             use_cache=True,
             return_dict=True,
         )
+        '''
+
+        # Assume image_embeds.shape[0] is the batch size (b) and you have 32 tokens (n)
+        b, n, _ = query_tokens.shape
+
+        # Step 1: Create a causal mask
+        causal_mask = torch.triu(torch.ones((n, n), device=device) * float('-inf'), diagonal=1)
+        
+        # Step 2: Apply causal mask in attention
+        # Add a new dimension to the mask for the batch size and expand it to match the batch size
+        causal_mask = causal_mask.unsqueeze(0).expand(b, -1, -1)  # shape: [b, n, n]
+        
+        query_output = self.image_tokenizer.model.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=image_embeds,
+            encoder_attention_mask=image_atts,
+            use_cache=True,
+            return_dict=True,
+            attention_mask=causal_mask,  # Apply causal mask here
+        )
 
         # Use last hidden state
         # We have 32 tokens, and use last token as image embedding
-        # [b, 768]
-        image_feats = F.normalize(query_output.last_hidden_state[:, -1, :], dim=1)
+        # [b, 32, 768]
+        image_feats = F.normalize(query_output.last_hidden_state[:, :, :], dim=1)
 
         text_tokens = self.image_tokenizer.model.tokenizer(
             text,
@@ -347,14 +371,19 @@ class SEEDTrainingWrapper(LightningModule):
         text_feats = F.normalize(text_output.last_hidden_state[:, 0, :], dim=1)
 
         ###============== Image-text Contrastive ===================###
-        # image_feats : [b, 768]
+        # image_feats : [b, 32, 768] => [32, b, 768]
         # text_feat : [b, 768] => [768, b]
+        # sim_i2t : [32, b, 768] * [768, b] => [32, b, b]
+        image_feats = rearrange(image_feats, "b n d -> n b d")
+        text_feats = rearrange(text_feats, "b d -> d b")
+
         sim_i2t = torch.matmul(
-            image_feats, text_feats.T
+            image_feats, text_feats
         ).squeeze()
 
         bs = image.size(0)
-        targets = torch.arange(bs, dtype=torch.long).to(device)
+        # targets : [32, b]
+        targets = torch.arange(bs, dtype=torch.long).repeat(32, 1).to(device)
 
         loss_itc = F.cross_entropy(sim_i2t, targets)
 
@@ -409,7 +438,6 @@ class SEEDTrainingWrapper(LightningModule):
 
         return reverse_output_proj
 
-
     def get_stage_2_loss(self, batch, batch_idx: int, is_validation=False):
         """_summary_
 
@@ -427,6 +455,7 @@ class SEEDTrainingWrapper(LightningModule):
         #------------------------
         causal_embeddings = self.get_causal_embeddings(img)
 
+        ''' bypass
         # TODO: query_output should be trained to be similar with text embedding
         # Image embedding is cross attentioned.
         # Notice: query_output_down is match to clip embedding?
@@ -435,6 +464,7 @@ class SEEDTrainingWrapper(LightningModule):
 
         # quant [b, 32, 32], loss_embed [b, 32, 768], embed_ind [b, 32]
         quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
+        
 
         #------------------------
         # Stage 2 - 2 : Reconstruction Caual Embedding
@@ -444,39 +474,51 @@ class SEEDTrainingWrapper(LightningModule):
         # decoder_task_layer upscale it to [b, 32, 768]
         # [b, 32, 32] => [b, 32, 768]
         query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
+        '''        
 
+        query_output_up = causal_embeddings
         # Transformer decoder
         query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
+        
+        
 
         # query_output_up_pos_image should be similar to original causal_embeddings
         # Maximize cosine similarity between query_output_up_pos_image and causal_embeddings
 
         loss_recon = F.cosine_similarity(query_output_up, causal_embeddings).mean()
-
+        
+        
+        
         #------------------------
         # Stage 2 - 3 : Reconstruction Generation Embedding
         #------------------------
 
         # MLP
+        # query_output_up = causal_embeddings
         reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
 
         gt_img_clip_embeddings = self.get_clip_img_embedding(img)
     
         loss_generation_embed = F.mse_loss(reverse_output_proj, gt_img_clip_embeddings)
 
-        loss_total = loss_embed - loss_recon + loss_generation_embed
+        #loss_total = loss_embed - loss_recon + loss_generation_embed
+        loss_total = loss_generation_embed
         loss_total = loss_total.mean()
 
-        loss_dict = {"loss_embed": loss_embed, "loss_recon": loss_recon,
-                "loss_generation_embed": loss_generation_embed,
-                "loss": loss_total}
+        # loss_dict = {"loss_embed": loss_embed, "loss_recon": loss_recon,
+        #         "loss_generation_embed": loss_generation_embed,
+        #         "loss": loss_total}
+        
+        loss_dict = {"loss_generation_embed": loss_generation_embed,
+                     "loss": loss_total}
 
         #------------------------
         # Logging
         #------------------------
-        generation_embedding_cosine_similarity = F.cosine_similarity(reverse_output_proj, gt_img_clip_embeddings).mean()
+        #generation_embedding_cosine_similarity = F.cosine_similarity(reverse_output_proj, gt_img_clip_embeddings).mean()
 
-        self.logging_train(generation_embedding_cosine_similarity, loss_dict)
+        #self.logging_train(generation_embedding_cosine_similarity, loss_dict)
+        self.logging_train(None, loss_dict)
 
         return loss_total
 
@@ -542,24 +584,30 @@ class SEEDTrainingWrapper(LightningModule):
         # Encoding text in list to ascii
         #batch.gt_txt = [[text[0].encode("ascii", "ignore").decode()] for text in batch.gt_txt]
 
-        stage_1_loss = self.get_stage_1_loss(batch, batch_idx)
-        # stage_2_loss = self.get_stage_2_loss(batch, batch_idx)
+        if self.current_epoch <= 5:
+            stage_1_loss = self.get_stage_1_loss(batch, batch_idx)
+            return stage_1_loss
+        else:
+            # Freeze stage 1 model
+            for param in self.image_tokenizer.model.Qformer.parameters():
+                param.requires_grad = False
+            stage_2_loss = self.get_stage_2_loss(batch, batch_idx)
+            return stage_2_loss
 
-        #return stage_1_loss
-        return stage_1_loss
-
+    @torch.no_grad()
     def validation_step(self, batch, batch_idx: int):
         image = self.transform_224(batch.img)
         image_embeds, _, _ = self.get_stage2_quant(image)
 
-        reconstructed_images = self.image_tokenizer.diffusion_model(
-            image_embeds=image_embeds,
-            negative_image_embeds=None,
-            guidance_scale=10,
-            noise_level=0,
-            num_inference_steps=100,
-            latents=self.image_tokenizer.latents,
-        ).images
+        with torch.no_grad():
+            reconstructed_images = self.image_tokenizer.diffusion_model(
+                image_embeds=image_embeds,
+                negative_image_embeds=None,
+                guidance_scale=10,
+                noise_level=0,
+                num_inference_steps=100,
+                latents=self.image_tokenizer.latents,
+            ).images
 
         tensor_images = []
         for img in reconstructed_images:
@@ -619,8 +667,13 @@ class SEEDTrainingWrapper(LightningModule):
         )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, betas=(0.9, 0.999), weight_decay=1e-8)
-        scheduler = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=100, num_training_steps=5000)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-8)
+        total_trainig_steps = 782 * self.cfg.experiment.max_epochs
+        scheduler = transformers.get_cosine_with_hard_restarts_schedule_with_warmup(
+            optimizer=optimizer,
+            num_warmup_steps=total_trainig_steps * 0.03,
+            num_training_steps=2 * total_trainig_steps,
+            num_cycles=2)
 
         lr_scheduler_config = {
             "scheduler": scheduler,
@@ -706,14 +759,15 @@ if __name__ == "__main__":
         # ),
         strategy="ddp",
         max_epochs=cfg.experiment.max_epochs,
-        deterministic=True,
+        deterministic=False,
         logger=tb_logger,
         log_every_n_steps=1,
         # val_check_interval=cfg.experiment.val_check_interval,
         check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
-        enable_checkpointing=cfg.experiment.enable_checkpointing,
+        # enable_checkpointing=cfg.experiment.enable_checkpointing,
+        enable_checkpointing=True,
         # Debug
-        num_sanity_val_steps=0,
+        num_sanity_val_steps=2,
         precision='bf16',
         # overfit_batches=cfg.experiment.overfit_batches,
         callbacks=[ModelSummary(max_depth=3), lr_logger],
