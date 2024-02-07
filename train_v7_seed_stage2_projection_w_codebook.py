@@ -164,16 +164,16 @@ class SEEDTrainingWrapper(LightningModule):
                 param.requires_grad = False
                 
             # unFreeze stage 2 model and initialize with random weights
-            # for param in self.image_tokenizer.model.encode_task_layer.parameters():
-            #     #nn.init.xavier_uniform_(param) 
-            #     nn.init.normal_(param, mean=0.0, std=0.02)              
-            #     param.requires_grad = True 
-            # for param in self.image_tokenizer.model.quantize.parameters():
-            #     nn.init.normal_(param, mean=0.0, std=0.02)
-            #     param.requires_grad = True
-            # for param in self.image_tokenizer.model.decode_task_layer.parameters():
-            #     nn.init.normal_(param, mean=0.0, std=0.02)
-            #     param.requires_grad = True
+            for param in self.image_tokenizer.model.encode_task_layer.parameters():
+                #nn.init.xavier_uniform_(param) 
+                nn.init.normal_(param, mean=0.0, std=0.02)              
+                param.requires_grad = True 
+            for param in self.image_tokenizer.model.quantize.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                param.requires_grad = True
+            for param in self.image_tokenizer.model.decode_task_layer.parameters():
+                nn.init.normal_(param, mean=0.0, std=0.02)
+                param.requires_grad = True
             
             for param in self.image_tokenizer.model.blocks_image.parameters():
                 nn.init.normal_(param, mean=0.0, std=0.02)
@@ -274,7 +274,13 @@ class SEEDTrainingWrapper(LightningModule):
             loss_embed = None
             embed_ind = None
             
-            query_output_up = causal_embeddings
+            query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
+
+            # quant [b, 32, 32], loss_embed [b, 32, 768], embed_ind [b, 32]
+            quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
+            
+            query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
+            
             query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
             
             quant = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
@@ -480,7 +486,6 @@ class SEEDTrainingWrapper(LightningModule):
         #------------------------
         causal_embeddings = self.get_causal_embeddings(img)
 
-        ''' bypass
         # TODO: query_output should be trained to be similar with text embedding
         # Image embedding is cross attentioned.
         # Notice: query_output_down is match to clip embedding?
@@ -499,9 +504,7 @@ class SEEDTrainingWrapper(LightningModule):
         # decoder_task_layer upscale it to [b, 32, 768]
         # [b, 32, 32] => [b, 32, 768]
         query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
-        '''        
 
-        query_output_up = causal_embeddings
         # Transformer decoder
         query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
         
@@ -510,8 +513,8 @@ class SEEDTrainingWrapper(LightningModule):
         # query_output_up_pos_image should be similar to original causal_embeddings
         # Maximize cosine similarity between query_output_up_pos_image and causal_embeddings
 
-        loss_recon = F.cosine_similarity(query_output_up, causal_embeddings).mean()
-        
+        #loss_recon = F.cosine_similarity(query_output_up, causal_embeddings).mean()
+        loss_recon = F.mse_loss(query_output_up, causal_embeddings)
         
         
         #------------------------
@@ -527,7 +530,7 @@ class SEEDTrainingWrapper(LightningModule):
         loss_generation_embed = F.mse_loss(reverse_output_proj, gt_img_clip_embeddings)
 
         #loss_total = loss_embed - loss_recon + loss_generation_embed
-        loss_total = loss_generation_embed
+        loss_total = loss_generation_embed + loss_embed + loss_recon
         loss_total = loss_total.mean()
 
         # loss_dict = {"loss_embed": loss_embed, "loss_recon": loss_recon,
@@ -535,6 +538,8 @@ class SEEDTrainingWrapper(LightningModule):
         #         "loss": loss_total}
         
         loss_dict = {"loss_generation_embed": loss_generation_embed,
+                     "loss_embed": loss_embed,
+                     "loss_recon": loss_recon,
                      "loss": loss_total}
 
         #------------------------
@@ -648,7 +653,10 @@ class SEEDTrainingWrapper(LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, betas=(0.9, 0.999), weight_decay=1e-8)
-        scheduler = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=100, num_training_steps=5000)
+        #scheduler = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=100, num_training_steps=5000)
+        num_training_steps = self.cfg.experiment.max_epochs * (1000000 / 4 / 1024)
+        scheduler = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=100, num_training_steps=num_training_steps)
+
 
         lr_scheduler_config = {
             "scheduler": scheduler,
