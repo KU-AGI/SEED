@@ -13,4 +13,5 @@ evaluation/*
 *.ckpt
 causal_embedding_test_images/*
 results/*
+token_histogram*/*
 ```
