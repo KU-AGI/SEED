@@ -135,7 +135,7 @@ class SEEDTrainingWrapper(LightningModule):
 
         # For SDS
         t_range = [0.2, 0.6]
-        # t_range = [0.02, 0.98]
+        t_range = [0.02, 0.98]
         self.num_train_timesteps = 1000
         self.min_step = int(self.num_train_timesteps * t_range[0])
         self.max_step = int(self.num_train_timesteps * t_range[1])
@@ -147,11 +147,11 @@ class SEEDTrainingWrapper(LightningModule):
         self.sample_image_ind = 0
         self.logged_original_image = set()
 
+
+    def setup(self, stage):
         for p in self.image_tokenizer.parameters():
             p.requires_grad = False
 
-
-    def setup(self, stage):
         # Setup training parameter
         self.image_tokenizer.model.train()
         for param in self.image_tokenizer.model.parameters():
@@ -159,22 +159,23 @@ class SEEDTrainingWrapper(LightningModule):
 
         for param in self.image_tokenizer.model.Qformer.parameters():
             param.requires_grad = False
-        # # Freeze ViT Encoder
-        # for param in self.image_tokenizer.model.visual_encoder.parameters():
-        #     param.requires_grad = False
-        #
-        # # Diffusion frozen
-        # for param in self.image_tokenizer.diffusion_model.image_encoder.parameters():
-        #     param.requires_grad = False
-        # for param in self.image_tokenizer.diffusion_model.image_normalizer.parameters():
-        #     param.requires_grad = False
-        # for param in self.image_tokenizer.diffusion_model.text_encoder.parameters():
-        #     param.requires_grad = False
-        # # In this case, unet is frozen
-        # for param in self.image_tokenizer.diffusion_model.unet.parameters():
-        #     param.requires_grad = False
-        # for param in self.image_tokenizer.diffusion_model.vae.parameters():
-        #     param.requires_grad = True
+
+        # Freeze ViT Encoder
+        for param in self.image_tokenizer.model.visual_encoder.parameters():
+            param.requires_grad = False
+
+        # Diffusion frozen
+        for param in self.image_tokenizer.diffusion_model.image_encoder.parameters():
+            param.requires_grad = False
+        for param in self.image_tokenizer.diffusion_model.image_normalizer.parameters():
+            param.requires_grad = False
+        for param in self.image_tokenizer.diffusion_model.text_encoder.parameters():
+            param.requires_grad = False
+        # In this case, unet is frozen
+        for param in self.image_tokenizer.diffusion_model.unet.parameters():
+            param.requires_grad = True
+        for param in self.image_tokenizer.diffusion_model.vae.parameters():
+            param.requires_grad = False
 
         # For fp16
         if self.cfg.optimizer.fp16:
@@ -735,6 +736,7 @@ class SEEDTrainingWrapper(LightningModule):
 
         clip_size_image = self.transform_224(batch.img)
         # For cosine similarity logging
+        # gt_txt_clip_embeddings = self.get_clip_text_embedding(batch.gt_txt)
         gt_img_clip_embeddings = self.get_clip_img_embedding(clip_size_image.float())
         with torch.no_grad():
             causal_embeddings = self.get_causal_embeddings(clip_size_image)
@@ -819,12 +821,13 @@ class SEEDTrainingWrapper(LightningModule):
 
         # gt_img_clip_embeddings = self.get_clip_img_embedding(batch.img)
         # loss = F.mse_loss(quant, gt_img_clip_embeddings)
-
-        # params = OrderedDict(self.image_tokenizer.model.Qformer.named_parameters())
-        # grads = torch.autograd.grad(stage_diffusion_loss, params.values(), allow_unused=True)
+        
+        loss = loss_sds + loss_recon + loss_embed
+        # params = OrderedDict(self.image_tokenizer.model.quantize.named_parameters())
+        # grads = torch.autograd.grad(loss, params.values(), allow_unused=True)
         # print(grads)
 
-        return loss_sds + loss_recon + loss_embed
+        return loss
 
     def validation_step(self, batch, batch_idx: int):
         image = self.transform_224(batch.img)
@@ -981,6 +984,9 @@ if __name__ == "__main__":
     datamodule.setup()
     train_dataloader = datamodule.train_dataloader()
     val_dataloader = datamodule.val_dataloader()
+
+    print(f"### Number of train: {len(train_dataloader)}")
+    print(f"### Number of valid: {len(val_dataloader)}")
 
     tb_logger = pl_loggers.TensorBoardLogger(save_dir=cfg.result_file_path)
     lr_logger = pl.callbacks.LearningRateMonitor(logging_interval="step")

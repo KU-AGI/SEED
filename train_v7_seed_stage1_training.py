@@ -66,6 +66,26 @@ NUM_IMG_TOKNES = 32
 NUM_IMG_CODES = 8192
 IMAGE_ID_SHIFT = 32000
 
+class GatherLayer(torch.autograd.Function):
+    """
+    Gather tensors from all workers with support for backward propagation:
+    This implementation does not cut the gradients as torch.distributed.all_gather does.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        output = [
+            torch.zeros_like(x) for _ in range(torch.distributed.get_world_size())
+        ]
+        torch.distributed.all_gather(output, x)
+        return tuple(output)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        all_gradients = torch.stack(grads)
+        torch.distributed.all_reduce(all_gradients)
+        return all_gradients[torch.distributed.get_rank()]
+
 class SEEDTrainingWrapper(LightningModule):
     """Training wrapper for SEED
 
@@ -82,7 +102,7 @@ class SEEDTrainingWrapper(LightningModule):
                             from_pretrained=True,
                             diffusion_model_path=cfg.checkpoint_path.diffusion_model_path,
                             load_diffusion=False,
-                            is_train_stage_1=False,
+                            is_train_stage_1=True,
                             )
 
         self.B = None
@@ -344,6 +364,22 @@ class SEEDTrainingWrapper(LightningModule):
 
         return reverse_output_proj, loss_embed, embed_ind
     
+    def all_gather_with_grad(self, tensors):
+        """
+        Performs all_gather operation on the provided tensors.
+        Graph remains connected for backward grad computation.
+        """
+        # Queue the gathered tensors
+        world_size = torch.distributed.get_world_size()
+        # There is no need for reduction in the single-proc case
+        if world_size == 1:
+            return tensors
+
+        # tensor_all = GatherLayer.apply(tensors)
+        tensor_all = GatherLayer.apply(tensors)
+
+        return torch.cat(tensor_all, dim=0)
+    
     @torch.no_grad()
     def concat_all_gather(self, tensor):
         """
@@ -394,7 +430,7 @@ class SEEDTrainingWrapper(LightningModule):
             encoder_attention_mask=image_atts,
             use_cache=True,
             return_dict=True,
-            attention_mask=causal_mask,  # Apply causal mask here
+            # attention_mask=causal_mask,  # Apply causal mask here
         )
 
         # Use last hidden state
@@ -571,6 +607,7 @@ class SEEDTrainingWrapper(LightningModule):
                 F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
                 + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
             ) / 2
+            print(f"Loss I2T: {loss_itc}")
 
             self.log(
                     "val/loss_itc",
@@ -648,10 +685,12 @@ class SEEDTrainingWrapper(LightningModule):
 
         ###============== Image-text Contrastive ===================###
         # Compute for each query token
-        image_feats_all = self.concat_all_gather(
+        # image_feats_all = self.concat_all_gather(
+        image_feats_all = self.all_gather_with_grad(
             image_feats
         )  # [batch_size*num_gpu, num_query_tokens, embed_dim]
-        text_feat_all = self.concat_all_gather(text_feat)  # [batch_size*num_gpu, embed_dim]
+        # text_feat_all = self.concat_all_gather(text_feat)  # [batch_size*num_gpu, embed_dim]
+        text_feat_all = self.all_gather_with_grad(text_feat)  # [batch_size*num_gpu, embed_dim]
 
         # image_feats.unsqueeze(1) : [batch_size, 1, num_query_tokens, embed_dim]
         # text_feat_all.unsqueeze(-1) : [batch_size*num_gpu, embed_dim, 1] => broadcast to [batch_size, batch_size*num_gpu, embed_dim, 1]
@@ -999,9 +1038,10 @@ if __name__ == "__main__":
     )
 
     wrapper = SEEDTrainingWrapper(cfg).to(device)
-    # wrapper = SEEDTrainingWrapper.load_from_checkpoint(
-    #     "/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_61_load_from_60/checkpoints/epoch=2-step=1656.ckpt",
-    #     cfg=cfg).to(device)
+    wrapper = SEEDTrainingWrapper.load_from_checkpoint(
+        "/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_50_stage_1_final_token_init_weight_new_version/checkpoints/epoch=31-step=25024.ckpt",
+        # "/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_61_load_from_60/checkpoints/epoch=2-step=1656.ckpt",
+        cfg=cfg).to(device)
     wrapper.setup("fit")
 
     trainer.fit(

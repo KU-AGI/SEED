@@ -3,7 +3,7 @@ tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
 result_path: ???
-result_file_path: ./logs/seed_stage_1_training_debug
+result_file_path: ./logs/seed_stage_1_histogram
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
@@ -43,8 +43,9 @@ stage2:
 
 experiment:
   seed: 0
+  local_batch_size: 16
   # local_batch_size: 256
-  local_batch_size: 310
+  # local_batch_size: 310
   # local_batch_size: 290 
   val_batch_size: 256 
   test_split: train
@@ -53,7 +54,7 @@ experiment:
   # overfit_batches: 1
   # val_check_interval: 100
   check_val_every_n_epoch: 1
-  enable_checkpointing: True
+  enable_checkpointing: False
   log_every_n_steps: 1
   num_sanity_val_steps: 2
 
