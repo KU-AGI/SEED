@@ -15,4 +15,6 @@ causal_embedding_test_images/*
 results/*
 token_histogram*/*
 data/32*
+data/cc3m_*
+logs_old/*
 ```
