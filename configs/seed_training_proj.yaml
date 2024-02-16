@@ -17,7 +17,7 @@ dist:
 
 dataset:
   type: webdataset
-  name: cc3m_coco_laion_coco
+  name: cc3m_coco_laion_coco3
   loc: bcloud
   num_workers: 8
   shuffle: True
@@ -40,7 +40,7 @@ stage2:
 
 experiment:
   seed: 0
-  local_batch_size: 2048
+  local_batch_size: 1024
   
   val_batch_size: 1
   test_split: train

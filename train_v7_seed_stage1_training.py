@@ -46,14 +46,13 @@ from pytorch_lightning.utilities import grad_norm
 
 from typing import Any, Callable, Dict, List, Optional, Union
 
-import numpy as np
-from PIL import Image
 from einops import rearrange
 import pdb
 from calculate_clip_score import calculate_clip_s_for_folder
 from coco_dataloader import CocoDataset
 from torch.utils.data import DataLoader
 from lavis.common.dist_utils import is_dist_avail_and_initialized
+import matplotlib.pyplot as plt
 
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
@@ -82,40 +81,41 @@ class SEEDTrainingWrapper(LightningModule):
                             fp16=cfg.optimizer.fp16,
                             from_pretrained=True,
                             diffusion_model_path=cfg.checkpoint_path.diffusion_model_path,
-                            load_diffusion=True,
+                            load_diffusion=False,
                             is_train_stage_1=True,
                             )
 
         self.B = None
         
-        # My code
-        # For make clip embedding directly from [b, 32, 32] to [b, 1024]
-        self.depth = 4
-        self.embedding_block = nn.ModuleList([
-            Block(dim=32,
-                    num_heads=16,
-                    mlp_ratio=4.0,
-                    qkv_bias=True,
-                    qk_scale=None,
-                    drop=0.0,
-                    attn_drop=0.0,
-                    drop_path=0.0,
-                    norm_layer=partial(nn.LayerNorm, eps=1e-6)) for i in range(self.depth)
-        ])
-        self.embedding_proj = nn.Linear(32 * 32, 1024).to(self.device)
+        # # My code
+        # # For make clip embedding directly from [b, 32, 32] to [b, 1024]
+        # self.depth = 4
+        # self.embedding_block = nn.ModuleList([
+        #     Block(dim=32,
+        #             num_heads=16,
+        #             mlp_ratio=4.0,
+        #             qkv_bias=True,
+        #             qk_scale=None,
+        #             drop=0.0,
+        #             attn_drop=0.0,
+        #             drop_path=0.0,
+        #             norm_layer=partial(nn.LayerNorm, eps=1e-6)) for i in range(self.depth)
+        # ])
+        # self.embedding_proj = nn.Linear(32 * 32, 1024).to(self.device)
 
         self.transform_224 = transforms.Resize((224, 224), antialias=True)
 
         # diffusions
-        self.feature_extractor = self.image_tokenizer.diffusion_model.feature_extractor
-        self.image_encoder = self.image_tokenizer.diffusion_model.image_encoder
-        self.image_normalizer = self.image_tokenizer.diffusion_model.image_normalizer
-        self.image_noising_scheduler = self.image_tokenizer.diffusion_model.image_noising_scheduler
-        self.tokenizer = self.image_tokenizer.diffusion_model.tokenizer
-        self.text_encoder = self.image_tokenizer.diffusion_model.text_encoder
-        self.unet = self.image_tokenizer.diffusion_model.unet
-        self.scheduler = self.image_tokenizer.diffusion_model.scheduler
-        self.vae = self.image_tokenizer.diffusion_model.vae
+        if self.image_tokenizer.diffusion_model is not None:
+            self.feature_extractor = self.image_tokenizer.diffusion_model.feature_extractor
+            self.image_encoder = self.image_tokenizer.diffusion_model.image_encoder
+            self.image_normalizer = self.image_tokenizer.diffusion_model.image_normalizer
+            self.image_noising_scheduler = self.image_tokenizer.diffusion_model.image_noising_scheduler
+            self.tokenizer = self.image_tokenizer.diffusion_model.tokenizer
+            self.text_encoder = self.image_tokenizer.diffusion_model.text_encoder
+            self.unet = self.image_tokenizer.diffusion_model.unet
+            self.scheduler = self.image_tokenizer.diffusion_model.scheduler
+            self.vae = self.image_tokenizer.diffusion_model.vae
 
         # For logging
         self.sample_embed_ind = None
@@ -137,9 +137,15 @@ class SEEDTrainingWrapper(LightningModule):
         if self.cfg.optimizer.fp16:
             self.image_tokenizer = self.image_tokenizer.half()
             self.image_encoder = self.image_encoder.half()
-            self.embedding_proj = self.embedding_proj.half()
-            for blk in self.embedding_block:
-                blk = blk.half()
+
+    def save_config(self):
+        config_save_path = os.path.join(self.logger.log_dir, "config.yaml")
+        with open(config_save_path, "w") as f:
+            json.dump(self.cfg, f, indent=4)
+    
+    def on_train_start(self):
+        print("Save config")
+        self.save_config()
 
     def setup(self, stage):
         # Setup training parameter
@@ -152,17 +158,44 @@ class SEEDTrainingWrapper(LightningModule):
             param.requires_grad = False
 
         # Diffusion frozen
-        for param in self.image_tokenizer.diffusion_model.image_encoder.parameters():
-            param.requires_grad = False
-        for param in self.image_tokenizer.diffusion_model.image_normalizer.parameters():
-            param.requires_grad = False
-        for param in self.image_tokenizer.diffusion_model.text_encoder.parameters():
-            param.requires_grad = False
-        # In this case, unet is frozen
-        for param in self.image_tokenizer.diffusion_model.unet.parameters():
-            param.requires_grad = False
-        for param in self.image_tokenizer.diffusion_model.vae.parameters():
-            param.requires_grad = False
+        if self.image_tokenizer.diffusion_model is not None:
+            for param in self.image_tokenizer.diffusion_model.image_encoder.parameters():
+                param.requires_grad = False
+            for param in self.image_tokenizer.diffusion_model.image_normalizer.parameters():
+                param.requires_grad = False
+            for param in self.image_tokenizer.diffusion_model.text_encoder.parameters():
+                param.requires_grad = False
+            # In this case, unet is frozen
+            for param in self.image_tokenizer.diffusion_model.unet.parameters():
+                param.requires_grad = False
+            for param in self.image_tokenizer.diffusion_model.vae.parameters():
+                param.requires_grad = False
+
+        if self.stage == 1:
+            # Set stage 1 model not trainable
+            for param in self.image_tokenizer.model.quantize.parameters():
+                param.requires_grad = False
+            for param in self.image_tokenizer.model.encode_task_layer.parameters():
+                param.requires_grad = False
+            for param in self.image_tokenizer.model.decode_task_layer.parameters():
+                param.requires_grad = False
+            for param in self.image_tokenizer.model.blocks.parameters():
+                param.requires_grad = False
+            for param in self.image_tokenizer.model.blocks_image.parameters():
+                param.requires_grad = False
+            for param in self.image_tokenizer.model.image_down.parameters():
+                param.requires_grad = False
+            for param in self.image_tokenizer.model.distill_image_proj.parameters():
+                param.requires_grad = False
+                
+            # Move stage 2 model to cpu
+            self.image_tokenizer.model.quantize = self.image_tokenizer.model.quantize.to("cpu")
+            self.image_tokenizer.model.encode_task_layer = self.image_tokenizer.model.encode_task_layer.to("cpu")
+            self.image_tokenizer.model.decode_task_layer = self.image_tokenizer.model.decode_task_layer.to("cpu")
+            self.image_tokenizer.model.blocks = self.image_tokenizer.model.blocks.to("cpu")
+            self.image_tokenizer.model.blocks_image = self.image_tokenizer.model.blocks_image.to("cpu")
+            self.image_tokenizer.model.image_down = self.image_tokenizer.model.image_down.to("cpu")
+            self.image_tokenizer.model.distill_image_proj = self.image_tokenizer.model.distill_image_proj.to("cpu")
             
         if self.stage == 2:
             for param in self.image_tokenizer.model.parameters():
@@ -189,14 +222,6 @@ class SEEDTrainingWrapper(LightningModule):
                 nn.init.normal_(param, mean=0.0, std=0.02)
                 param.requires_grad = True
             
-        # For fp16
-        if self.cfg.optimizer.fp16:
-            self.image_tokenizer = self.image_tokenizer.half()
-            self.image_encoder = self.image_encoder.half()
-            self.embedding_proj = self.embedding_proj.half()
-            for blk in self.embedding_block:
-                blk = blk.half()
-        
         # For test training
         # self.image_tokenizer.model.distill_image_proj = nn.Linear(32 * 32, 1024).to(self.device)
 
@@ -268,21 +293,19 @@ class SEEDTrainingWrapper(LightningModule):
     def get_stage2_quant(self, img):
         # Causal embedding is trained in stage 1.
         causal_embeddings = self.get_causal_embeddings(img)
+        query_output_up = causal_embeddings
 
         # [b, 32, 32]
-        query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
+        # query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
 
         # For debug
-        quant = query_output_down
         loss_embed = None
         embed_ind = None
 
-        # Simple flatten and linear projection
-        # Debug : Try to use transformer
-        # for blk in self.embedding_block:
-        #     quant = blk(quant)
-        quant = quant.view(quant.shape[0], -1)
-        quant = self.embedding_proj(quant)
+        query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
+
+        quant = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
+
 
         return quant, loss_embed, embed_ind
 
@@ -338,6 +361,188 @@ class SEEDTrainingWrapper(LightningModule):
 
         output = torch.cat(tensors_gather, dim=0)
         return output
+
+    @torch.no_grad()
+    def check_image_text_similarity(self, batch, batch_idx: int, save_dir="image_text_similarity"):
+        device = self.device
+        image, text, image_id = batch
+        rank = dist.get_rank()
+
+        with torch.no_grad():
+            image_embeds = self.image_tokenizer.model.ln_vision(
+                self.image_tokenizer.model.visual_encoder(image)
+            )
+        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device)
+
+        query_tokens = self.image_tokenizer.model.query_tokens.expand(image_embeds.shape[0], -1, -1)
+
+
+        # Assume image_embeds.shape[0] is the batch size (b) and you have 32 tokens (n)
+        b, n, _ = query_tokens.shape
+
+        # Step 1: Create a causal mask
+        causal_mask = torch.triu(torch.ones((n, n), device=device) * float('-inf'), diagonal=1)
+        
+        # Step 2: Apply causal mask in attention
+        # Add a new dimension to the mask for the batch size and expand it to match the batch size
+        causal_mask = causal_mask.unsqueeze(0).expand(b, -1, -1)  # shape: [b, n, n]
+        
+        query_output = self.image_tokenizer.model.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=image_embeds,
+            encoder_attention_mask=image_atts,
+            use_cache=True,
+            return_dict=True,
+            attention_mask=causal_mask,  # Apply causal mask here
+        )
+
+        # Use last hidden state
+        # We have 32 tokens, and use last token as image embedding
+        # [b, 32, 768]
+        image_feats = F.normalize(query_output.last_hidden_state, dim=1)
+
+        text_tokens = self.image_tokenizer.model.tokenizer(
+            text,
+            padding="max_length",
+            truncation=True,
+            max_length=128,
+            return_tensors="pt",
+        )
+
+        text_output = self.image_tokenizer.model.Qformer.bert(
+            text_tokens.input_ids.to(device),
+            attention_mask=text_tokens.attention_mask.to(device),
+            return_dict=True,
+        )
+
+        # CLS token
+        # [b, 768]
+        text_feat = F.normalize(text_output.last_hidden_state[:, 0, :], dim=1)
+
+        ###============== Image-text Contrastive ===================###
+
+        # Original BLIP-2 loss
+        # Compute for each query token
+        image_feats_all = image_feats # [batch_size, num_query_tokens, embed_dim]
+        text_feat_all = text_feat  # [batch_size, embed_dim]
+
+        # image_feats.unsqueeze(1) : [batch_size, 1, num_query_tokens, embed_dim]
+        # text_feat_all.unsqueeze(-1) : [batch_size*num_gpu, embed_dim, 1] => broadcast to [batch_size, batch_size*num_gpu, embed_dim, 1]
+        # Last two dimensions are broadcasted to all other dimensions
+        # [j, 1, n, m] x [k, m, p] => [j, k, n, p]
+        # https://pytorch.org/docs/stable/generated/torch.matmul.html
+        # sim_q2t : [batch_size, batch_size*num_gpu, num_query_tokens]
+        sim_q2t = torch.matmul(
+            rearrange(image_feats, "bs n d -> bs 1 n d"), rearrange(text_feat_all, "bs_X_ngpus d -> bs_X_ngpus d 1")
+            # image_feats.unsqueeze(1), text_feat_all.unsqueeze(-1)
+        ).squeeze()
+        # [batch_size, batch_size*num_gpu, num_query_tokens]
+
+        # image-text similarity: aggregate across all query tokens
+        sim_i2t, _ = sim_q2t.max(-1)
+        sim_i2t = sim_i2t / self.temp
+
+        # Debug: for check the similarity
+        count_dict = {}
+        for token_num in range(32):
+            count_dict[token_num] = 0
+            for row in range(b):
+                _, ind = sim_q2t[:, :, token_num][row].max(-1)
+                if row == ind:
+                    print(f"In token {token_num}, in row {row}, max index is {ind}")
+                    count_dict[token_num] += 1
+        print(count_dict)
+
+        # Extracting keys and values
+        keys = list(count_dict.keys())
+        values = list(count_dict.values())
+
+        # Plotting the histogram
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(keys, values, color='blue')
+        plt.xlabel('Token Number')
+        plt.ylabel('Value')
+        plt.title('Histogram of Token Values')
+        plt.xticks(keys)  # Ensure all keys are shown in the x-axis
+
+        # Adding the text on top of each bar
+        for bar in bars:
+            yval = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2.0, yval, int(yval), va='bottom')
+
+        os.makedirs(f"{save_dir}", exist_ok=True)
+        plt.savefig(f"{save_dir}/token_histogram_image_text_batch{batch_idx}_rank{rank}.png")
+        # plt.show()
+        ############################################################
+
+        # text-query similarity: [batch_size, batch_size*num_gpu, num_query_tokens]
+        sim_t2q = torch.matmul(
+            rearrange(text_feat, "bs d -> bs 1 1 d"), rearrange(image_feats_all, "bs_X_ngpus n d -> bs_X_ngpus d n")
+            # text_feat.unsqueeze(1).unsqueeze(1), image_feats_all.permute(0, 2, 1)
+        ).squeeze()
+
+        # text-image similarity: aggregate across all query tokens
+        sim_t2i, _ = sim_t2q.max(-1)
+        sim_t2i = sim_t2i / self.temp  # [batch_size, batch_size*num_gpu]
+
+        # Debug: for check the similarity
+        count_dict = {}
+        for token_num in range(32):
+            count_dict[token_num] = 0
+            for row in range(b):
+                _, ind = sim_t2q[:, :, token_num][row].max(-1)
+                if row == ind:
+                    print(f"In token {token_num}, in row {row}, max index is {ind}")
+                    count_dict[token_num] += 1
+        print(count_dict)
+
+        # Softmax for each row
+        dump = []
+        for token_num in range(32):
+            dump.append(F.softmax(sim_t2q[:, :, token_num], dim=1))
+        dump = torch.stack(dump, dim=2)
+
+        # Extracting keys and values
+        keys = list(count_dict.keys())
+        values = list(count_dict.values())
+
+        # Plotting the histogram
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(keys, values, color='blue')
+        plt.xlabel('Token Number')
+        plt.ylabel('Value')
+        plt.title('Histogram of Token Values')
+        plt.xticks(keys)  # Ensure all keys are shown in the x-axis
+
+        # Adding the text on top of each bar
+        for bar in bars:
+            yval = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2.0, yval, int(yval), va='bottom')
+
+        plt.savefig(f"{save_dir}/token_histogram_text_image_batch{batch_idx}_rank{rank}.png")
+
+        rank = dist.get_rank()
+        if rank == 0:
+            bs = image.size(0)
+            targets = torch.linspace(rank * bs, rank * bs + bs - 1, bs, dtype=int).to(
+                image.device
+            )
+
+            loss_itc = (
+                F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
+                + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
+            ) / 2
+
+            self.log(
+                    "val/loss_itc",
+                    loss_itc,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=True,
+                    logger=True,
+                )
+
+        return
 
     def get_stage_1_loss_original_blip(self, batch, batch_idx: int, is_validation=False):
         """_summary_
@@ -413,34 +618,6 @@ class SEEDTrainingWrapper(LightningModule):
         text_feat = F.normalize(text_output.last_hidden_state[:, 0, :], dim=1)
 
         ###============== Image-text Contrastive ===================###
-        '''
-        # image_feats : [b, 32, 768] => [32, b, 768]
-        # text_feat : [b, 768] => [768, b]
-        # sim_i2t : [32, b, 768] * [768, b] => [32, b, b]
-        
-
-        image_feats = rearrange(image_feats, "b n d -> n b d")
-        text_feats = rearrange(text_feats, "b d -> d b")
-
-        sim_i2t = torch.matmul(
-            image_feats, text_feats
-        ).squeeze()
-
-        bs = image.size(0)
-        # targets : [32, b]
-        targets = torch.arange(bs, dtype=torch.long).repeat(32, 1).to(device)
-
-        loss_itc = F.cross_entropy(sim_i2t, targets)
-
-        self.log(
-                "train/loss_itc",
-                loss_itc,
-                on_step=True,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
-        '''
         # Original BLIP-2 loss
         # Compute for each query token
         image_feats_all = self.concat_all_gather(
@@ -455,7 +632,7 @@ class SEEDTrainingWrapper(LightningModule):
         # https://pytorch.org/docs/stable/generated/torch.matmul.html
         # sim_q2t : [batch_size, batch_size*num_gpu, num_query_tokens]
         sim_q2t = torch.matmul(
-            rearrange(image_feats, "bs n d -> bs 1 n d"), rearrange(text_feat_all, "bs_X_ngpus d -> bs_X_ngpus d 1")
+            rearrange(image_feats, "bs n d -> bs 1 n d"), rearrange(text_feat_all, "(bs ngpus) d -> (bs ngpus) d 1", bs=b)
             # image_feats.unsqueeze(1), text_feat_all.unsqueeze(-1)
         ).squeeze()
         # [batch_size, batch_size*num_gpu, num_query_tokens]
@@ -464,85 +641,15 @@ class SEEDTrainingWrapper(LightningModule):
         sim_i2t, _ = sim_q2t.max(-1)
         sim_i2t = sim_i2t / self.temp
 
-        '''
-        # Debug: for check the similarity
-        count_dict = {}
-        for token_num in range(32):
-            count_dict[token_num] = 0
-            for row in range(self.B):
-                _, ind = sim_q2t[:, :, token_num][row].max(-1)
-                if row == ind:
-                    print(f"In token {token_num}, in row {row}, max index is {ind}")
-                    count_dict[token_num] += 1
-        print(count_dict)
-        import matplotlib.pyplot as plt
-
-        # Extracting keys and values
-        keys = list(count_dict.keys())
-        values = list(count_dict.values())
-
-        # Plotting the histogram
-        plt.figure(figsize=(10, 6))
-        bars = plt.bar(keys, values, color='blue')
-        plt.xlabel('Token Number')
-        plt.ylabel('Value')
-        plt.title('Histogram of Token Values')
-        plt.xticks(keys)  # Ensure all keys are shown in the x-axis
-
-        # Adding the text on top of each bar
-        for bar in bars:
-            yval = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2.0, yval, int(yval), va='bottom')
-
-        save_dir = "token_histogram_full_token_trained_seed_weight"
-        os.makedirs(f"{save_dir}", exist_ok=True)
-        plt.savefig(f"{save_dir}/token_histogram_image_text_batch{batch_idx}.png")
-        # plt.show()
-        ############################################################
-        '''
-
         # text-query similarity: [batch_size, batch_size*num_gpu, num_query_tokens]
         sim_t2q = torch.matmul(
-            rearrange(text_feat, "bs d -> bs 1 1 d"), rearrange(image_feats_all, "bs_X_ngpus n d -> bs_X_ngpus d n")
+            rearrange(text_feat, "bs d -> bs 1 1 d"), rearrange(image_feats_all, "(bs ngpus) n d -> (bs ngpus) d n", bs=b)
             # text_feat.unsqueeze(1).unsqueeze(1), image_feats_all.permute(0, 2, 1)
         ).squeeze()
 
         # text-image similarity: aggregate across all query tokens
         sim_t2i, _ = sim_t2q.max(-1)
         sim_t2i = sim_t2i / self.temp  # [batch_size, batch_size*num_gpu]
-
-        '''
-        # Debug: for check the similarity
-        count_dict = {}
-        for token_num in range(32):
-            count_dict[token_num] = 0
-            for row in range(self.B):
-                _, ind = sim_t2q[:, :, token_num][row].max(-1)
-                if row == ind:
-                    print(f"In token {token_num}, in row {row}, max index is {ind}")
-                    count_dict[token_num] += 1
-        print(count_dict)
-        import matplotlib.pyplot as plt
-
-        # Extracting keys and values
-        keys = list(count_dict.keys())
-        values = list(count_dict.values())
-
-        # Plotting the histogram
-        plt.figure(figsize=(10, 6))
-        bars = plt.bar(keys, values, color='blue')
-        plt.xlabel('Token Number')
-        plt.ylabel('Value')
-        plt.title('Histogram of Token Values')
-        plt.xticks(keys)  # Ensure all keys are shown in the x-axis
-
-        # Adding the text on top of each bar
-        for bar in bars:
-            yval = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2.0, yval, int(yval), va='bottom')
-
-        plt.savefig(f"{save_dir}/token_histogram_text_image_batch{batch_idx}.png")
-        '''
 
         rank = dist.get_rank()
         bs = image.size(0)
@@ -566,7 +673,7 @@ class SEEDTrainingWrapper(LightningModule):
 
         return loss_itc
         
-    def get_stage_1_loss_use_last_token(self, batch, batch_idx: int, is_validation=False):
+    def get_stage_1_loss_use_last_token(self, batch, batch_idx: int):
         """
             Contrastive loss using last token of the query_output
         Args:
@@ -609,7 +716,7 @@ class SEEDTrainingWrapper(LightningModule):
         # We have 32 tokens, and use last token as image embedding
         # [b, 32, 768]
         # TODO: Use 'final' causal embedding? Does it mean to use last token embedding?
-        image_feats = F.normalize(rearrange(query_output.last_hidden_state[:, -1, :], "bs d -> bs 1 d"), dim=1)
+        image_feats = F.normalize(query_output.last_hidden_state, dim=1)
 
         text_tokens = self.image_tokenizer.model.tokenizer(
             text,
@@ -636,25 +743,29 @@ class SEEDTrainingWrapper(LightningModule):
         )  # [batch_size*num_gpu, num_query_tokens, embed_dim]
         text_feat_all = self.concat_all_gather(text_feat)  # [batch_size*num_gpu, embed_dim]
 
-        # image_feats.unsqueeze(1) : [batch_size, 1, 1, embed_dim]
+        # image_feats.unsqueeze(1) : [batch_size, 1, num_query_tokens, embed_dim]
         # text_feat_all.unsqueeze(-1) : [batch_size*num_gpu, embed_dim, 1] => broadcast to [batch_size, batch_size*num_gpu, embed_dim, 1]
         # Last two dimensions are broadcasted to all other dimensions
         # [j, 1, n, m] x [k, m, p] => [j, k, n, p]
         # https://pytorch.org/docs/stable/generated/torch.matmul.html
-        # sim_q2t : [batch_size, batch_size*num_gpu, 1]
-        sim_i2t = torch.matmul(
-            rearrange(image_feats, "bs n d -> bs 1 n d"), rearrange(text_feat_all, "bs_X_ngpus d -> bs_X_ngpus d 1")
+        # sim_q2t : [batch_size, batch_size*num_gpu, num_query_tokens]
+        sim_q2t = torch.matmul(
+            rearrange(image_feats, "bs n d -> bs 1 n d"), rearrange(text_feat_all, "(bs ngpus) d -> (bs ngpus) d 1", bs=b)
         ).squeeze()
-        # [batch_size, batch_size*num_gpu]
+        # [batch_size, batch_size*num_gpu, num_query_tokens]
 
+        # Always use last token
+        sim_i2t = sim_q2t[:, :, -1]
         sim_i2t = sim_i2t / self.temp
 
-        # text-query similarity: [batch_size, batch_size*num_gpu, 1]
-        sim_t2i = torch.matmul(
-            rearrange(text_feat, "bs d -> bs 1 1 d"), rearrange(image_feats_all, "bs_X_ngpus n d -> bs_X_ngpus d n")
+        # text-query similarity: [batch_size, batch_size*num_gpu, num_query_tokens]
+        sim_t2q = torch.matmul(
+            rearrange(text_feat, "bs d -> bs 1 1 d"), rearrange(image_feats_all, "(bs ngpus) n d -> (bs ngpus) d n", bs=b)
         ).squeeze()
-        # [batch_size, batch_size*num_gpu]
+        # [batch_size, batch_size*num_gpu, num_query_tokens]
 
+        # Always use last token
+        sim_t2i = sim_t2q[:, :, -1]
         sim_t2i = sim_t2i / self.temp  # [batch_size, batch_size*num_gpu]
 
         rank = dist.get_rank()
@@ -739,12 +850,12 @@ class SEEDTrainingWrapper(LightningModule):
         # TODO: query_output should be trained to be similar with text embedding
         # Image embedding is cross attentioned.
         # Notice: query_output_down is match to clip embedding?
+        '''
         # [b, 32, 32]
         query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
 
         # quant [b, 32, 32], loss_embed [b, 32, 768], embed_ind [b, 32]
         quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
-        
 
         #------------------------
         # Stage 2 - 2 : Reconstruction Caual Embedding
@@ -754,8 +865,12 @@ class SEEDTrainingWrapper(LightningModule):
         # decoder_task_layer upscale it to [b, 32, 768]
         # [b, 32, 32] => [b, 32, 768]
         query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
+        '''
+        
 
-        # query_output_up = causal_embeddings
+        # bypass the quantization
+        query_output_up = causal_embeddings
+
         # Transformer decoder
         query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
         
@@ -780,11 +895,11 @@ class SEEDTrainingWrapper(LightningModule):
         loss_generation_embed = F.mse_loss(reverse_output_proj, gt_img_clip_embeddings)
 
         # loss_total = loss_embed - loss_recon + loss_generation_embed
-        loss_total = loss_embed + loss_recon + loss_generation_embed
+        # loss_total = loss_embed + loss_recon + loss_generation_embed
+        loss_total = loss_recon + loss_generation_embed
         loss_total = loss_total.mean()
 
-        loss_dict = {"loss_embed": loss_embed,
-                     "loss_recon": loss_recon,
+        loss_dict = {"loss_recon": loss_recon,
                     "loss_generation_embed": loss_generation_embed,
                     "loss": loss_total}
         
@@ -818,6 +933,7 @@ class SEEDTrainingWrapper(LightningModule):
             logger=True,
         )
 
+        '''
         self.log(
             "train/codebook_loss_embed",
             loss_dict["loss_embed"].mean(),
@@ -826,6 +942,7 @@ class SEEDTrainingWrapper(LightningModule):
             prog_bar=True,
             logger=True,
         )
+        '''
 
         self.log(
             "train/reconstruction_loss",
@@ -870,20 +987,32 @@ class SEEDTrainingWrapper(LightningModule):
         # Encoding text in list to ascii
         #batch.gt_txt = [[text[0].encode("ascii", "ignore").decode()] for text in batch.gt_txt]
 
+        # self.check_image_text_similarity(batch, batch_idx, save_dir="token_histogram_final_token_trained_v3")
+        # return
+
         # Learn half of the max epochs
-        if self.current_epoch < (self.cfg.experiment.max_epochs // 2):
-            stage_1_loss = self.get_stage_1_loss_use_last_token(batch, batch_idx)
-            # stage_1_loss = self.get_stage_1_loss_original_blip(batch, batch_idx)
-            return stage_1_loss
-        else:
-            self.set_stage2_learnable()
-            stage_2_loss = self.get_stage_2_loss(batch, batch_idx)
-            return stage_2_loss
+        stage_1_loss = self.get_stage_1_loss_use_last_token(batch, batch_idx)
+        return stage_1_loss
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx: int):
+        if self.logger is not None and isinstance(self.logger, pl.loggers.TensorBoardLogger):
+            tb_log_dir = self.logger.log_dir
+        else:
+            tb_log_dir = self.cfg.result_file_path  # Fallback directory if logger is not set
+
+        if batch_idx < 10:
+            save_path = f"{tb_log_dir}/histogram"
+            os.makedirs(save_path, exist_ok=True)
+            save_path = f"{tb_log_dir}/histogram/epoch_{self.current_epoch}"
+            os.makedirs(save_path, exist_ok=True)
+            self.check_image_text_similarity(batch, batch_idx, save_dir=save_path)
+            return
+        else:
+            return
+
         image, captions, image_id = batch
-        image_embeds, _, _ = self.get_original_stage2_quant(image)
+        image_embeds, _, _ = self.get_stage2_quant(image)
         
         with torch.no_grad():
             reconstructed_images = self.image_tokenizer.diffusion_model(
@@ -960,28 +1089,21 @@ class SEEDTrainingWrapper(LightningModule):
             next(self.image_tokenizer.model.Qformer.bert.encoder.layer[7].attention.self.value.parameters()),
             global_step=self.global_step,
         )
-        
-        self.logger.experiment.add_histogram(
-            "weight_distribution/embedding_proj",
-            next(self.embedding_proj.parameters()),
-            global_step=self.global_step,
-        )
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.cfg.optimizer.max_lr,
-            betas=(0.9, 0.999),
-            weight_decay=1e-8)
+            betas=(self.cfg.hyperparameters.beta_1, self.cfg.hyperparameters.beta_2),
+            weight_decay=self.cfg.hyperparameters.weight_decay,)
 
-        total_trainig_steps = 2 * 423 * self.cfg.experiment.max_epochs
-        # total_trainig_steps = 2 * 814 * self.cfg.experiment.max_epochs
-        # total_trainig_steps = 2 * 782 * self.cfg.experiment.max_epochs
-        scheduler = transformers.get_cosine_with_hard_restarts_schedule_with_warmup(
+        total_training_steps = self.cfg.experiment.total_training_steps
+
+        scheduler = transformers.get_cosine_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=total_trainig_steps * 0.03,
-            num_training_steps=total_trainig_steps,
-            num_cycles=2)
+            num_warmup_steps=total_training_steps * 0.03,
+            num_training_steps=total_training_steps,
+            )
 
         lr_scheduler_config = {
             "scheduler": scheduler,
@@ -991,8 +1113,7 @@ class SEEDTrainingWrapper(LightningModule):
         }
 
         return {"optimizer": optimizer,
-                "lr_scheduler": lr_scheduler_config,
-                "gradient_clip_val": self.cfg.optimizer.grad_clip_val}
+                "lr_scheduler": lr_scheduler_config,}
         
     def on_before_optimizer_step(self, optimizer, optimizer_idx):
         # Compute the 2-norm for each layer
@@ -1019,15 +1140,9 @@ class SEEDTrainingWrapper(LightningModule):
                 norms_7[norm],
                 global_step=self.global_step,
             )
-        norms_proj = grad_norm(self.embedding_proj, norm_type=2)
-        for norm in norms_proj.keys():
-            self.logger.experiment.add_scalar(
-                f"grad_norm/embedding_proj/{norm}",
-                norms_proj[norm],
-                global_step=self.global_step,
-            )
 
     def on_validation_epoch_end(self):
+        return
         if self.logger is not None and isinstance(self.logger, pl.loggers.TensorBoardLogger):
             tb_log_dir = self.logger.log_dir
         else:
@@ -1058,7 +1173,6 @@ if __name__ == "__main__":
     cfg, cfg_yaml = build_config()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # cfg.tokenizer_cfg_path = "configs/tokenizer/seed_llama_tokenizer.yaml"
     seed_everything(cfg.experiment.seed, workers=True)
 
     transform_cfg = OmegaConf.load(cfg.transform_cfg_path)
@@ -1075,9 +1189,13 @@ if __name__ == "__main__":
         total_gpus=cfg.dist.n_gpus,
     )
 
+    # Set Training Dataset
     datamodule.setup()
     train_dataloader = datamodule.train_dataloader()
+    # cfg.experiment.total_training_steps = int((len(train_dataloader) * cfg.experiment.max_epochs) / (cfg.dist.n_gpus * cfg.experiment.grad_accumulation))
+    cfg.experiment.total_training_steps = int(553 * cfg.experiment.max_epochs)
 
+    # Set Validation Dataset
     karpathy_file = cfg.karpathy_file_path
     root_dir = cfg.root_dir
     start_index = 0
@@ -1092,14 +1210,8 @@ if __name__ == "__main__":
         accelerator=device,
         num_nodes=cfg.dist.n_nodes,
         devices=cfg.dist.n_gpus,
-        # strategy=DDPStrategy(
-        #     find_unused_parameters=True,
-        #     ddp_comm_hook=default_hooks.fp16_compress_hook
-        #     if cfg.optimizer.fp16_grad_comp
-        #     else None,
-        # ),
         strategy="ddp",
-        max_epochs=2 * cfg.experiment.max_epochs,
+        max_epochs=cfg.experiment.max_epochs,
         deterministic=False,
         logger=tb_logger,
         log_every_n_steps=cfg.experiment.log_every_n_steps,
@@ -1110,15 +1222,17 @@ if __name__ == "__main__":
         precision=str(cfg.optimizer.precision),
         callbacks=[ModelSummary(max_depth=3), lr_logger],
         accumulate_grad_batches=cfg.experiment.grad_accumulation,
+        # gradient_clip_val=cfg.optimizer.gradient_clip_val,
     )
 
-    wrapper = SEEDTrainingWrapper(cfg).to(device)
+    # wrapper = SEEDTrainingWrapper(cfg).to(device)
+    wrapper = SEEDTrainingWrapper.load_from_checkpoint(
+        "/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_62_load_from_61/checkpoints/epoch=33-step=18768.ckpt"
+         cfg=cfg).to(device)
     wrapper.setup("fit")
 
     trainer.fit(
         wrapper, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader,
-        # ckpt_path="/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_46_stage_1_full_token_init_weight_and_stage_2_training_epoch_40_resume/checkpoints/epoch=39-step=31280.ckpt"
-        # ckpt_path="/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_47_stage_1_final_token_init_weight_and_stage_2_training_epoch_46/checkpoints/epoch=45-step=35972.ckpt"
-        # ckpt_path="/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_43_stage_1_full_token_seed_weight/checkpoints/epoch=1-step=1564.ckpt"
+        # ckpt_path="/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_60_resume_from_55/checkpoints/epoch=5-step=3427.ckpt"
     )
     trainer.strategy.barrier()

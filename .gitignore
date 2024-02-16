@@ -17,4 +17,5 @@ token_histogram*/*
 data/32*
 data/cc3m_*
 logs_old/*
+datamodules/cc3m_index.json
 ```

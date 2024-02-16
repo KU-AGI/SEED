@@ -741,6 +741,11 @@ if __name__ == "__main__":
         accumulate_grad_batches=cfg.experiment.grad_accumulation
     )
 
+    #wrapper = SEEDTrainingWrapper(cfg).to(device)
+    # checkpoint_path = '/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_50_stage_1_final_token_init_weight_new_version/checkpoints/epoch=31-step=25024.ckpt'
+    # wrapper = SEEDTrainingWrapper.load_from_checkpoint(checkpoint_path, cfg=cfg, strict=False).to(device)
+    # wrapper.setup("fit")
+    
     wrapper = SEEDTrainingWrapper(cfg).to(device)
     wrapper.setup("fit")
 

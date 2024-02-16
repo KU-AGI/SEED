@@ -553,32 +553,32 @@ class SEEDTrainingWrapper(LightningModule):
         return loss_total
 
     def logging_train(self, generation_embedding_cosine_similarity, loss_dict):
-        # self.log(
-        #     "train/generation_embedding_cosine_similarity",
-        #     generation_embedding_cosine_similarity,
-        #     on_step=True,
-        #     on_epoch=True,
-        #     prog_bar=True,
-        #     logger=True,
-        # )
+        self.log(
+            "train/generation_embedding_cosine_similarity",
+            loss_dict["loss_generation_embed"].mean(),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
 
-        # self.log(
-        #     "train/codebook_loss_embed",
-        #     loss_dict["loss_embed"].mean(),
-        #     on_step=True,
-        #     on_epoch=True,
-        #     prog_bar=True,
-        #     logger=True,
-        # )
+        self.log(
+            "train/codebook_loss_embed",
+            loss_dict["loss_embed"].mean(),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
 
-        # self.log(
-        #     "train/reconstruction_loss",
-        #     loss_dict["loss_recon"].mean(),
-        #     on_step=True,
-        #     on_epoch=True,
-        #     prog_bar=True,
-        #     logger=True,
-        # )
+        self.log(
+            "train/reconstruction_loss",
+            loss_dict["loss_recon"].mean(),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
 
         self.log(
             "train/generation_embed_loss",

@@ -3,7 +3,8 @@ tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/diffusion_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
 result_path: none
-result_file_path: ./logs/overfitting_test_debug
+result_file_path: ./logs/sds_test
+#result_file_path: ./logs/overfitting_test_debug
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
@@ -43,7 +44,7 @@ experiment:
   local_batch_size: 2
   val_batch_size: 2
   test_split: train
-  max_epochs: 10000
+  max_epochs: 300
   grad_accumulation: 1
   overfit_batches: 1
   # val_check_interval: 100
@@ -51,5 +52,5 @@ experiment:
   enable_checkpointing: False
 
 optimizer:
-  fp16: False
+  fp16: True
   grad_clip_val: 0.5

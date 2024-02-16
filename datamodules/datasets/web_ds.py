@@ -35,7 +35,8 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
              "signals17m", "it2it22m",
              "coco", "cc15m_vg_sbu", "cc15m_vg_sbu_kb100m", "cc15m_vg_sbu_signals17m",
              "coco2014", "cc3m_coco", "mscoco", "mscoco_debug",
-             "cc3m_coco_laion_coco"}
+             "cc3m_coco_laion_coco",  "cc3m_coco_laion_coco2", "cc3m_coco_laion_coco3",
+             "cc15m_3m_laion400M_karpathy"}
     splits = {"train", "val"}
     locs = {"bcloud", "gcp"}
     urls_info = {
@@ -196,7 +197,15 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
         ("cc3m_coco", "bcloud", "val",): (
             "/ssd0/data/cc3m/{00321..00331}.tar",
         ),
-        # CC3M + COCO + LAION-COCO 10M
+        ("cc15m_3m_laion400M_karpathy", "bcloud", "train",): (
+            "/ssd0/data/coco_karpathy/train/{00000..00056}.tar",
+            "/ssd0/data/cc15m_3m/{00000..01573}.tar",
+            "/ssd0/data/laion400m-data/{00000..00099}.tar",
+        ),
+        ("cc15m_3m_laion400M_karpathy", "bcloud", "val",): (
+            "/ssd0/data/coco_karpathy/val/{00000..00056}.tar",
+        ),
+        # CC3M + COCO + LAION-COCO 27M
         ("cc3m_coco_laion_coco", "bcloud", "train",): (
             "/ssd0/data/cc3m/{00000..00331}.tar",
             "/ssd0/data/mscoco/{00000..00059}.tar",
@@ -204,7 +213,24 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
         ),
         ("cc3m_coco_laion_coco", "bcloud", "val",): (
             "/ssd0/data/coco_karpathy/train/{00000..00056}.tar"
+        ),
+        ("cc3m_coco_laion_coco2", "bcloud", "train",): (
+            "/ssd0/data/cc3m/{00000..00331}.tar",
+            "/ssd0/data/coco_karpathy/train{00000..00056}.tar",
+            "/ssd0/data/laion-coco-final/{00000..62412}.tar" 
+        ),
+        ("cc3m_coco_laion_coco2", "bcloud", "val",): (
+            "/ssd0/data/coco_karpathy/train/{00000..00056}.tar"
+        ),
+        ("cc3m_coco_laion_coco3", "bcloud", "train",): (
+            "/ssd0/data/cc3m_filtered_v3/{00000..00331}_filtered.tar",
+            "/ssd0/data/coco_karpathy/train{00000..00056}.tar",
+            "/ssd0/data/laion-coco-final/{00000..62412}.tar" 
+        ),
+        ("cc3m_coco_laion_coco3", "bcloud", "val",): (
+            "/ssd0/data/coco_karpathy/train/{00000..00056}.tar"
         )
+        
     }
 
     def __init__(
@@ -370,6 +396,27 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
                 ret = 1000000
             else:
                 ret = 560000 
+            return ret
+        elif name == 'cc3m_coco_laion_coco2':
+            if split == "train":
+                #ret = 3310000 + 414113 + 10000000
+                ret = 1000000
+            else:
+                ret = 560000 
+            return ret
+        elif name == 'cc3m_coco_laion_coco3':
+            if split == "train":
+                #ret = 3310000 + 414113 + 10000000
+                ret = 1000000
+            else:
+                ret = 560000 
+            return ret
+        elif name == 'cc15m_3m_laion400M_karpathy':
+            if split == "train":
+                # ret = 15740000 + 57000 + 100000
+                ret = 1000000
+            else:
+                ret = 560000
             return ret
         else:
             raise ValueError()

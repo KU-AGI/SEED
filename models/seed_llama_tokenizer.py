@@ -38,6 +38,7 @@ class ImageTokenizer(nn.Module):
         if not from_pretrained:
             model = Blip2QformerQuantizer(vit_precision='fp16' if fp16 else 'fp32', is_train=True, **kwargs)
         elif is_train_stage_1:
+            print('Load from BERT Weights')
             model = Blip2QformerQuantizer.from_pretrained_debug(pretrained_model_path=model_path,
                                                         #vit_precision='fp16' if fp16 else 'fp32',
                                                         vit_precision='bf16',
@@ -57,6 +58,113 @@ class ImageTokenizer(nn.Module):
                                                                           #torch_dtype=torch.float16 if fp16 else torch.float32
                                                                           torch_dtype=torch.bfloat16)
         else:
+            diffusion_model = None
+            self.diffusion_model = None
+
+        model = model.to(device)
+        if diffusion_model is not None:
+            diffusion_model = diffusion_model.to(device)
+
+        processor = transforms.Compose([
+            transforms.Resize((image_size, image_size), interpolation=3),
+            # transforms.Resize(image_size, interpolation=3),
+            # transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
+        ])
+
+        shape_latents = torch.Size([1, 4, 96, 96])
+        self.latents = torch.randn(shape_latents, generator=None, device=device, dtype=torch.bfloat16, layout=torch.strided)
+
+        shape_noise = torch.Size([1, 1024])
+        self.noise = torch.randn(shape_noise, generator=None, device=device, dtype=torch.bfloat16, layout=torch.strided)
+
+        self.model = model
+        if diffusion_model is not None:
+            self.diffusion_model = diffusion_model
+        self.processor = processor
+        self.device = device
+        self.fp16 = fp16
+
+    def __len__(self):
+        return self.model.n_embed
+
+    def encode(self, image_torch):
+        '''Convert a batch of img to code
+        Args:
+            model: The tokenizer model.
+            img: [b, c, h, w]
+        '''
+        if len(image_torch.shape) == 3:
+            image_torch = image_torch.unsqueeze(0)
+
+        # img = image_torch.to(self.device)
+        img = image_torch
+        if self.fp16:
+            img = img.half()
+        with torch.no_grad():
+            # id is index of codebook
+            id, _ = self.model.get_codebook_indices(img)
+        return id.view(img.shape[0], -1)
+
+    def decode(self, indices, negative_indices=None, guidance_scale=10, num_inference_steps=20):
+        # image_embed = [1, 1024]
+        image_embeds = self.model.get_codebook_entry(indices)
+        # image = self.diffusion_model(image_embeds=image_embed,
+        #                              noise_level=0,
+        #                              num_inference_steps=20,
+        #                              latents=self.latents,
+        #                              noise=self.noise).images
+        if negative_indices is not None:
+            assert indices.shape == negative_indices.shape, 'Negative indices must have the same shape with indices'
+            negative_image_embeds = self.model.get_codebook_entry(negative_indices)
+        else:
+            negative_image_embeds = None
+
+        image = self.diffusion_model(
+            image_embeds=image_embeds,
+            negative_image_embeds=negative_image_embeds,
+            guidance_scale=guidance_scale,
+            noise_level=0,
+            num_inference_steps=num_inference_steps,
+            latents=self.latents,
+        ).images
+        return image
+
+
+class ImageTokenizer2(nn.Module):
+    def __init__(self,
+                 model_path,
+                 diffusion_model_path=None,
+                 load_diffusion=False,
+                 image_size=224,
+                 device='cuda',
+                 fp16=True,
+                 from_pretrained=True,
+                 is_train_stage_1=False,
+                 **kwargs):
+        super().__init__()
+        from .seed_qformer.qformer_quantizer import Blip2QformerQuantizer
+        vit_precision = 'fp16' if fp16 else 'fp32'
+        dtype = torch.float16 if fp16 else torch.float32
+        if not from_pretrained:
+            model = Blip2QformerQuantizer(vit_precision=vit_precision, is_train=True, **kwargs)
+        elif is_train_stage_1:
+            model = Blip2QformerQuantizer.from_pretrained_debug(pretrained_model_path=model_path,
+                                                        vit_precision=vit_precision,
+                                                        is_train=True,
+                                                        **kwargs)#.eval()
+        else:
+            model = Blip2QformerQuantizer.from_pretrained(pretrained_model_path=model_path,
+                                                        vit_precision=vit_precision,
+                                                        is_train=False,
+                                                        **kwargs)
+
+        if diffusion_model_path is not None and load_diffusion:
+            # diffusion_model = DiffusionPipeline.from_pretrained(diffusion_model_path,
+            #                                                     torch_dtype=torch.float16 if fp16 else torch.float32)
+            diffusion_model = StableUnCLIPImg2ImgPipeline.from_pretrained(diffusion_model_path, torch_dtype=dtype)
+        else:
             self.diffusion_model = None
 
         model = model.to(device)
@@ -75,10 +183,10 @@ class ImageTokenizer(nn.Module):
             model = model.half()
 
         shape_latents = torch.Size([1, 4, 96, 96])
-        self.latents = torch.randn(shape_latents, generator=None, device=device, dtype=torch.bfloat16, layout=torch.strided)
+        self.latents = torch.randn(shape_latents, generator=None, device=device, dtype=dtype, layout=torch.strided)
 
         shape_noise = torch.Size([1, 1024])
-        self.noise = torch.randn(shape_noise, generator=None, device=device, dtype=torch.bfloat16, layout=torch.strided)
+        self.noise = torch.randn(shape_noise, generator=None, device=device, dtype=dtype, layout=torch.strided)
 
         self.model = model
         if diffusion_model is not None:
