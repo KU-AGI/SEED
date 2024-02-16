@@ -82,7 +82,7 @@ class SEEDTrainingWrapper(LightningModule):
                             from_pretrained=True,
                             diffusion_model_path=cfg.checkpoint_path.diffusion_model_path,
                             load_diffusion=False,
-                            is_train_stage_1=True,
+                            is_train_stage_1=False,
                             )
 
         self.B = None
@@ -381,7 +381,8 @@ class SEEDTrainingWrapper(LightningModule):
         b, n, _ = query_tokens.shape
 
         # Step 1: Create a causal mask
-        causal_mask = torch.triu(torch.ones((n, n), device=device) * float('-inf'), diagonal=1)
+        # causal_mask = torch.triu(torch.ones((n, n), device=device) * float('-inf'), diagonal=1)
+        causal_mask = torch.triu(torch.ones((n, n), device=device), diagonal=1)
         
         # Step 2: Apply causal mask in attention
         # Add a new dimension to the mask for the batch size and expand it to match the batch size
@@ -438,10 +439,33 @@ class SEEDTrainingWrapper(LightningModule):
         ).squeeze()
         # [batch_size, batch_size*num_gpu, num_query_tokens]
 
-        # image-text similarity: aggregate across all query tokens
-        sim_i2t, _ = sim_q2t.max(-1)
+        # image-text similarity: Use last token
+        sim_i2t = sim_q2t[:, :, -1]
         sim_i2t = sim_i2t / self.temp
 
+        ########### 1. Debug: for check the similarity ############
+        # Softmax for each row
+        dump = []
+        for token_num in range(32):
+            dump.append(F.softmax(sim_q2t[:, :, token_num], dim=1))
+        dump = torch.stack(dump, dim=2)
+        positive_token_similarity = torch.diagonal(dump, dim1=0, dim2=1).mean(dim=1)
+        # Save positive_token_similarity as bar graph
+        plt.figure(figsize=(18, 6))
+        bars = plt.bar(list(range(32)), positive_token_similarity.cpu().numpy(), color='blue')
+        plt.xlabel('Token Number')
+        plt.ylabel('Value')
+        plt.title('Positive Token Similarity')
+        plt.xticks(list(range(32)))  # Ensure all keys are shown in the x-axis
+        # Add a table of values next to the bars
+        cell_text = [[f"{val:.4f}"] for val in positive_token_similarity.cpu().numpy()]
+        plt.table(cellText=cell_text, colLabels=["Value"], loc='right', cellLoc='center')
+
+        # Adjust layout to make room for the table:
+        plt.subplots_adjust(right=0.5)
+        plt.savefig(f"{save_dir}/positive_token_similarity_i2t_batch{batch_idx}_rank{rank}.png")
+
+        ############################################################
         # Debug: for check the similarity
         count_dict = {}
         for token_num in range(32):
@@ -481,8 +505,8 @@ class SEEDTrainingWrapper(LightningModule):
             # text_feat.unsqueeze(1).unsqueeze(1), image_feats_all.permute(0, 2, 1)
         ).squeeze()
 
-        # text-image similarity: aggregate across all query tokens
-        sim_t2i, _ = sim_t2q.max(-1)
+        # text-image similarity: Use last token
+        sim_t2i = sim_t2q[:, :, -1]
         sim_t2i = sim_t2i / self.temp  # [batch_size, batch_size*num_gpu]
 
         # Debug: for check the similarity
@@ -501,6 +525,21 @@ class SEEDTrainingWrapper(LightningModule):
         for token_num in range(32):
             dump.append(F.softmax(sim_t2q[:, :, token_num], dim=1))
         dump = torch.stack(dump, dim=2)
+        positive_token_similarity = torch.diagonal(dump, dim1=0, dim2=1).mean(dim=1)
+        # Save positive_token_similarity as bar graph
+        plt.figure(figsize=(18, 6))
+        bars = plt.bar(list(range(32)), positive_token_similarity.cpu().numpy(), color='blue')
+        plt.xlabel('Token Number')
+        plt.ylabel('Value')
+        plt.title('Positive Token Similarity')
+        plt.xticks(list(range(32)))  # Ensure all keys are shown in the x-axis
+        # Add a table of values next to the bars
+        cell_text = [[f"{val:.4f}"] for val in positive_token_similarity.cpu().numpy()]
+        plt.table(cellText=cell_text, colLabels=["Value"], loc='right', cellLoc='center')
+
+        # Adjust layout to make room for the table:
+        plt.subplots_adjust(right=0.5)
+        plt.savefig(f"{save_dir}/positive_token_similarity_t2i_batch{batch_idx}_rank{rank}.png")
 
         # Extracting keys and values
         keys = list(count_dict.keys())
@@ -544,135 +583,6 @@ class SEEDTrainingWrapper(LightningModule):
 
         return
 
-    def get_stage_1_loss_original_blip(self, batch, batch_idx: int, is_validation=False):
-        """_summary_
-
-        Args:
-            batch (_type_): _description_
-            batch_idx (int): _description_
-            is_validation (bool, optional): _description_. Defaults to False.
-        """
-        # image = self.transform_224(batch.img)
-        device = self.device
-        image = batch.img.to(device)
-        text = [text[0].encode("ascii", "ignore").decode() for text in batch.gt_txt]
-        with torch.no_grad():
-            image_embeds = self.image_tokenizer.model.ln_vision(
-                self.image_tokenizer.model.visual_encoder(image)
-            )
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device)
-
-        query_tokens = self.image_tokenizer.model.query_tokens.expand(image_embeds.shape[0], -1, -1)
-
-        # Bidirectional cross attention
-        '''
-        query_output = self.image_tokenizer.model.Qformer.bert(
-            query_embeds=query_tokens,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_atts,
-            use_cache=True,
-            return_dict=True,
-        )
-        '''
-
-        # Assume image_embeds.shape[0] is the batch size (b) and you have 32 tokens (n)
-        b, n, _ = query_tokens.shape
-
-        # Step 1: Create a causal mask
-        causal_mask = torch.triu(torch.ones((n, n), device=device) * float('-inf'), diagonal=1)
-        
-        # Step 2: Apply causal mask in attention
-        # Add a new dimension to the mask for the batch size and expand it to match the batch size
-        causal_mask = causal_mask.unsqueeze(0).expand(b, -1, -1)  # shape: [b, n, n]
-        
-        query_output = self.image_tokenizer.model.Qformer.bert(
-            query_embeds=query_tokens,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_atts,
-            use_cache=True,
-            return_dict=True,
-            attention_mask=causal_mask,  # Apply causal mask here
-        )
-
-        # Use last hidden state
-        # We have 32 tokens, and use last token as image embedding
-        # [b, 32, 768]
-        image_feats = F.normalize(query_output.last_hidden_state, dim=1)
-
-        text_tokens = self.image_tokenizer.model.tokenizer(
-            text,
-            padding="max_length",
-            truncation=True,
-            max_length=128,
-            return_tensors="pt",
-        )
-
-        text_output = self.image_tokenizer.model.Qformer.bert(
-            text_tokens.input_ids.to(device),
-            attention_mask=text_tokens.attention_mask.to(device),
-            return_dict=True,
-        )
-
-        # CLS token
-        # [b, 768]
-        text_feat = F.normalize(text_output.last_hidden_state[:, 0, :], dim=1)
-
-        ###============== Image-text Contrastive ===================###
-        # Original BLIP-2 loss
-        # Compute for each query token
-        image_feats_all = self.concat_all_gather(
-            image_feats
-        )  # [batch_size*num_gpu, num_query_tokens, embed_dim]
-        text_feat_all = self.concat_all_gather(text_feat)  # [batch_size*num_gpu, embed_dim]
-
-        # image_feats.unsqueeze(1) : [batch_size, 1, num_query_tokens, embed_dim]
-        # text_feat_all.unsqueeze(-1) : [batch_size*num_gpu, embed_dim, 1] => broadcast to [batch_size, batch_size*num_gpu, embed_dim, 1]
-        # Last two dimensions are broadcasted to all other dimensions
-        # [j, 1, n, m] x [k, m, p] => [j, k, n, p]
-        # https://pytorch.org/docs/stable/generated/torch.matmul.html
-        # sim_q2t : [batch_size, batch_size*num_gpu, num_query_tokens]
-        sim_q2t = torch.matmul(
-            rearrange(image_feats, "bs n d -> bs 1 n d"), rearrange(text_feat_all, "(bs ngpus) d -> (bs ngpus) d 1", bs=b)
-            # image_feats.unsqueeze(1), text_feat_all.unsqueeze(-1)
-        ).squeeze()
-        # [batch_size, batch_size*num_gpu, num_query_tokens]
-
-        # image-text similarity: aggregate across all query tokens
-        sim_i2t, _ = sim_q2t.max(-1)
-        sim_i2t = sim_i2t / self.temp
-
-        # text-query similarity: [batch_size, batch_size*num_gpu, num_query_tokens]
-        sim_t2q = torch.matmul(
-            rearrange(text_feat, "bs d -> bs 1 1 d"), rearrange(image_feats_all, "(bs ngpus) n d -> (bs ngpus) d n", bs=b)
-            # text_feat.unsqueeze(1).unsqueeze(1), image_feats_all.permute(0, 2, 1)
-        ).squeeze()
-
-        # text-image similarity: aggregate across all query tokens
-        sim_t2i, _ = sim_t2q.max(-1)
-        sim_t2i = sim_t2i / self.temp  # [batch_size, batch_size*num_gpu]
-
-        rank = dist.get_rank()
-        bs = image.size(0)
-        targets = torch.linspace(rank * bs, rank * bs + bs - 1, bs, dtype=int).to(
-            image.device
-        )
-
-        loss_itc = (
-            F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
-            + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
-        ) / 2
-
-        self.log(
-                "train/loss_itc",
-                loss_itc,
-                on_step=True,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
-
-        return loss_itc
-        
     def get_stage_1_loss_use_last_token(self, batch, batch_idx: int):
         """
             Contrastive loss using last token of the query_output
@@ -707,9 +617,9 @@ class SEEDTrainingWrapper(LightningModule):
             query_embeds=query_tokens,
             encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_atts,
-            use_cache=True,
+            # use_cache=True,
             return_dict=True,
-            attention_mask=causal_mask,  # Apply causal mask here
+            # attention_mask=causal_mask,  # Apply causal mask here
         )
 
         # Use last hidden state
@@ -790,139 +700,6 @@ class SEEDTrainingWrapper(LightningModule):
 
         return loss_itc
 
-    def forward_stage_2(self,batch, batch_idx: int):
-        """_summary_
-        Original forward function for stage 2        
-
-        Args:
-            batch (_type_): _description_
-            batch_idx (int): _description_
-
-        Returns:
-            _type_: _description_
-        """        
-
-        # Causal embedding is trained in stage 1.
-        # [b, 32, 768]
-        causal_embeddings = self.get_causal_embeddings(batch.img)
-
-        # [b, 32, 768] = > [b, 32, 32]
-        query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
-
-        # quant [b, 32, 32], loss_embed [b, 32, 768], embed_ind [b, 32]
-        quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
-
-        embed_ind = embed_ind.reshape(quant.shape[0], -1)
-
-        # [b, 32, 32] => [b, 32, 768]
-        query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
-
-        quant_embedding = self.image_tokenizer.model.quantize.get_codebook_entry(embed_ind)
-
-        # [b, 32, 32] => [b, 32, 768]
-        query_output_up = self.image_tokenizer.model.decode_task_layer(quant_embedding)
-
-        # [b, 32, 768] => [b, 32, 768]
-        query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
-
-        # [b, 32, 768] => [b, 32, 32] => [b, 1024]
-        reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
-
-        return reverse_output_proj
-
-    def get_stage_2_loss(self, batch, batch_idx: int, is_validation=False):
-        """_summary_
-
-        Args:
-            batch (_type_): _description_
-            batch_idx (int): _description_
-        """        
-        #------------------------
-        # Stage 2 Training
-        #------------------------
-        img = self.transform_224(batch.img)
-
-        #------------------------
-        # Stage 2 - 1 : Codebook Training
-        #------------------------
-        causal_embeddings = self.get_causal_embeddings(img)
-
-        # TODO: query_output should be trained to be similar with text embedding
-        # Image embedding is cross attentioned.
-        # Notice: query_output_down is match to clip embedding?
-        '''
-        # [b, 32, 32]
-        query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
-
-        # quant [b, 32, 32], loss_embed [b, 32, 768], embed_ind [b, 32]
-        quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
-
-        #------------------------
-        # Stage 2 - 2 : Reconstruction Caual Embedding
-        #------------------------
-
-        # quant embedding dimension is [b, 32, 32]
-        # decoder_task_layer upscale it to [b, 32, 768]
-        # [b, 32, 32] => [b, 32, 768]
-        query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
-        '''
-        
-
-        # bypass the quantization
-        query_output_up = causal_embeddings
-
-        # Transformer decoder
-        query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
-        
-        
-
-        # query_output_up_pos_image should be similar to original causal_embeddings
-        # Maximize cosine similarity between query_output_up_pos_image and causal_embeddings
-
-        # loss_recon = F.normalize(F.cosine_similarity(query_output_up, causal_embeddings)).mean()
-        loss_recon = F.mse_loss(query_output_up, causal_embeddings)
-        
-        #------------------------
-        # Stage 2 - 3 : Reconstruction Generation Embedding
-        #------------------------
-
-        # MLP
-        # query_output_up = causal_embeddings
-        reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
-
-        gt_img_clip_embeddings = self.get_clip_img_embedding(img)
-    
-        loss_generation_embed = F.mse_loss(reverse_output_proj, gt_img_clip_embeddings)
-
-        # loss_total = loss_embed - loss_recon + loss_generation_embed
-        # loss_total = loss_embed + loss_recon + loss_generation_embed
-        loss_total = loss_recon + loss_generation_embed
-        loss_total = loss_total.mean()
-
-        loss_dict = {"loss_recon": loss_recon,
-                    "loss_generation_embed": loss_generation_embed,
-                    "loss": loss_total}
-        
-        # loss_dict = {"loss_generation_embed": loss_generation_embed,
-        #              "loss": loss_total}
-
-        #------------------------
-        # Logging
-        #------------------------
-        generation_embedding_cosine_similarity = F.cosine_similarity(reverse_output_proj, gt_img_clip_embeddings).mean()
-
-        self.logging_train(generation_embedding_cosine_similarity, loss_dict)
-
-        norms_0 = grad_norm(self.image_tokenizer.model.decode_task_layer, norm_type=2)
-        for norm in norms_0.keys():
-            self.logger.experiment.add_scalar(
-                f"grad_norm/image_tokenizer/model/decode_task_layer/{norm}",
-                norms_0[norm],
-                global_step=self.global_step,
-            )
-
-        return loss_total
-
     def logging_train(self, generation_embedding_cosine_similarity, loss_dict):
         self.log(
             "train/generation_embedding_cosine_similarity",
@@ -987,10 +764,6 @@ class SEEDTrainingWrapper(LightningModule):
         # Encoding text in list to ascii
         #batch.gt_txt = [[text[0].encode("ascii", "ignore").decode()] for text in batch.gt_txt]
 
-        # self.check_image_text_similarity(batch, batch_idx, save_dir="token_histogram_final_token_trained_v3")
-        # return
-
-        # Learn half of the max epochs
         stage_1_loss = self.get_stage_1_loss_use_last_token(batch, batch_idx)
         return stage_1_loss
 
@@ -1225,10 +998,10 @@ if __name__ == "__main__":
         # gradient_clip_val=cfg.optimizer.gradient_clip_val,
     )
 
-    # wrapper = SEEDTrainingWrapper(cfg).to(device)
-    wrapper = SEEDTrainingWrapper.load_from_checkpoint(
-        "/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_62_load_from_61/checkpoints/epoch=33-step=18768.ckpt"
-         cfg=cfg).to(device)
+    wrapper = SEEDTrainingWrapper(cfg).to(device)
+    # wrapper = SEEDTrainingWrapper.load_from_checkpoint(
+    #     "/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_61_load_from_60/checkpoints/epoch=2-step=1656.ckpt",
+    #     cfg=cfg).to(device)
     wrapper.setup("fit")
 
     trainer.fit(
