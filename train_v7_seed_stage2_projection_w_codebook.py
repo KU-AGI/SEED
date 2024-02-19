@@ -11,8 +11,6 @@ import time
 import json
 
 import argparse
-
-import argparse
 import time
 
 import hydra
@@ -32,8 +30,6 @@ from datamodules.tokenizers import TokenizerUtils
 from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
 import torch.nn.functional as F
 from pytorch_lightning.strategies import DDPStrategy, DDPFullyShardedStrategy
-import open_clip
-from info_nce import InfoNCE, info_nce
 from models.seed_llama_tokenizer import ImageTokenizer
 import transformers
 
@@ -46,8 +42,6 @@ from pytorch_lightning.utilities import grad_norm
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
-from PIL import Image
-import pdb
 
 from coco_dataloader import CocoDataset
 from torch.utils.data import DataLoader
@@ -77,49 +71,35 @@ class SEEDTrainingWrapper(LightningModule):
         # Target model to train
         self.image_tokenizer = ImageTokenizer(model_path=cfg.checkpoint_path.model_path,
                             fp16=cfg.optimizer.fp16,
+                            vit_precision=cfg.optimizer.vit_precision,
+                            diffusion_precision=cfg.optimizer.diffusion_precision,
                             from_pretrained=True,
                             diffusion_model_path=cfg.checkpoint_path.diffusion_model_path,
                             load_diffusion=True,
                             )
 
         self.B = None
-        
-        # My code
-        # For make clip embedding directly from [b, 32, 32] to [b, 1024]
-        self.depth = 4
-        self.embedding_block = nn.ModuleList([
-            Block(dim=32,
-                    num_heads=16,
-                    mlp_ratio=4.0,
-                    qkv_bias=True,
-                    qk_scale=None,
-                    drop=0.0,
-                    attn_drop=0.0,
-                    drop_path=0.0,
-                    norm_layer=partial(nn.LayerNorm, eps=1e-6)) for i in range(self.depth)
-        ])
-        self.embedding_proj = nn.Linear(32 * 32, 1024).to(self.device)
 
         self.transform_224 = transforms.Resize((224, 224), antialias=True)
 
-        # diffusions
-        self.feature_extractor = self.image_tokenizer.diffusion_model.feature_extractor
-        self.image_encoder = self.image_tokenizer.diffusion_model.image_encoder
-        self.image_normalizer = self.image_tokenizer.diffusion_model.image_normalizer
-        self.image_noising_scheduler = self.image_tokenizer.diffusion_model.image_noising_scheduler
-        self.tokenizer = self.image_tokenizer.diffusion_model.tokenizer
-        self.text_encoder = self.image_tokenizer.diffusion_model.text_encoder
-        self.unet = self.image_tokenizer.diffusion_model.unet
-        self.scheduler = self.image_tokenizer.diffusion_model.scheduler
-        self.vae = self.image_tokenizer.diffusion_model.vae
+        # For diffusion DDP
+        if self.image_tokenizer.diffusion_model is not None:
+            self.feature_extractor = self.image_tokenizer.diffusion_model.feature_extractor
+            self.image_encoder = self.image_tokenizer.diffusion_model.image_encoder
+            self.image_normalizer = self.image_tokenizer.diffusion_model.image_normalizer
+            self.image_noising_scheduler = self.image_tokenizer.diffusion_model.image_noising_scheduler
+            self.tokenizer = self.image_tokenizer.diffusion_model.tokenizer
+            self.text_encoder = self.image_tokenizer.diffusion_model.text_encoder
+            self.unet = self.image_tokenizer.diffusion_model.unet
+            self.scheduler = self.image_tokenizer.diffusion_model.scheduler
+            self.vae = self.image_tokenizer.diffusion_model.vae
 
         # For logging
-        self.sample_embed_ind = None
         self.pil_to_tensor = transforms.ToTensor()
         self.sample_image_ind = 0
         self.logged_original_image = set()
         
-        self.stage = 2
+        self.stage = cfg.experiment.stage
     
     def random_initialize_stage2_model_weights(self):
         """Random initialize stage 2 model weights
@@ -127,14 +107,38 @@ class SEEDTrainingWrapper(LightningModule):
         # Random initialize stage 2 model weights
         for param in self.image_tokenizer.model.parameters():
             param.requires_grad = False
-
-        # For fp16
-        if self.cfg.optimizer.fp16:
-            self.image_tokenizer = self.image_tokenizer.half()
-            self.image_encoder = self.image_encoder.half()
-            self.embedding_proj = self.embedding_proj.half()
-            for blk in self.embedding_block:
-                blk = blk.half()
+        
+        # unFreeze stage 2 model and initialize with random weights
+        for param in self.image_tokenizer.model.encode_task_layer.parameters():
+            #nn.init.xavier_uniform_(param) 
+            nn.init.normal_(param, mean=0.0, std=0.02)              
+            param.requires_grad = True 
+        for param in self.image_tokenizer.model.quantize.parameters():
+            nn.init.normal_(param, mean=0.0, std=0.02)
+            param.requires_grad = True
+        for param in self.image_tokenizer.model.decode_task_layer.parameters():
+            nn.init.normal_(param, mean=0.0, std=0.02)
+            param.requires_grad = True
+        
+        for param in self.image_tokenizer.model.blocks_image.parameters():
+            nn.init.normal_(param, mean=0.0, std=0.02)
+            param.requires_grad = True
+        
+        for param in self.image_tokenizer.model.image_down.parameters():
+            nn.init.normal_(param, mean=0.0, std=0.02)
+            param.requires_grad = True
+        for param in self.image_tokenizer.model.distill_image_proj.parameters():
+            nn.init.normal_(param, mean=0.0, std=0.02)
+            param.requires_grad = True
+        
+    def save_config(self):
+        config_save_path = os.path.join(self.logger.log_dir, "config.yaml")
+        with open(config_save_path, "w") as f:
+            json.dump(self.cfg, f, indent=4)
+    
+    def on_train_start(self):
+        print("Save config")
+        self.save_config()
 
     def setup(self, stage):
         # Setup training parameter
@@ -160,57 +164,13 @@ class SEEDTrainingWrapper(LightningModule):
             param.requires_grad = False
             
         if self.stage == 2:
-            for param in self.image_tokenizer.model.parameters():
-                param.requires_grad = False
-                
-            # unFreeze stage 2 model and initialize with random weights
-            for param in self.image_tokenizer.model.encode_task_layer.parameters():
-                #nn.init.xavier_uniform_(param) 
-                nn.init.normal_(param, mean=0.0, std=0.02)              
-                param.requires_grad = True 
-            for param in self.image_tokenizer.model.quantize.parameters():
-                nn.init.normal_(param, mean=0.0, std=0.02)
-                param.requires_grad = True
-            for param in self.image_tokenizer.model.decode_task_layer.parameters():
-                nn.init.normal_(param, mean=0.0, std=0.02)
-                param.requires_grad = True
-            
-            for param in self.image_tokenizer.model.blocks_image.parameters():
-                nn.init.normal_(param, mean=0.0, std=0.02)
-                param.requires_grad = True
-            
-            for param in self.image_tokenizer.model.image_down.parameters():
-                nn.init.normal_(param, mean=0.0, std=0.02)
-                param.requires_grad = True
-            for param in self.image_tokenizer.model.distill_image_proj.parameters():
-                nn.init.normal_(param, mean=0.0, std=0.02)
-                param.requires_grad = True
+            self.random_initialize_stage2_model_weights()
             
         ## make dump folder
         os.makedirs(self.cfg.result_path, exist_ok=True)
-
-        # For fp16
-        if self.cfg.optimizer.fp16:
-            self.image_tokenizer = self.image_tokenizer.half()
-            self.image_encoder = self.image_encoder.half()
-            self.embedding_proj = self.embedding_proj.half()
-            for blk in self.embedding_block:
-                blk = blk.half()
-        
-        # For test training
-        # self.image_tokenizer.model.distill_image_proj = nn.Linear(32 * 32, 1024).to(self.device)
     
     def on_validation_epoch_start(self):
         os.makedirs(f"{self.cfg.result_path}/{self.current_epoch}", exist_ok=True)
-
-    def load_sample_images(self, dataloader):
-        self.sample_images = []
-        for idx, batch in enumerate(dataloader):
-            if idx > 1:
-                break
-            else:
-                self.sample_images.append(batch.img.to(self.device))
-        self.sample_images = torch.cat(self.sample_images, dim=0)
 
     def get_clip_text_embedding(self, batch_text):
         """CLIP text embedding
@@ -270,9 +230,6 @@ class SEEDTrainingWrapper(LightningModule):
             quant = quant.view(quant.shape[0], -1)
             quant = self.embedding_proj(quant)
             '''
-            quant = None
-            loss_embed = None
-            embed_ind = None
             
             query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
 
@@ -327,96 +284,6 @@ class SEEDTrainingWrapper(LightningModule):
         reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
 
         return reverse_output_proj #, loss_embed, embed_ind
-
-
-    def get_stage_1_loss(self, batch, batch_idx: int, is_validation=False):
-        """_summary_
-
-        Args:
-            batch (_type_): _description_
-            batch_idx (int): _description_
-            is_validation (bool, optional): _description_. Defaults to False.
-        """
-        device = batch.img.device
-        image = self.transform_224(batch.img)
-        text = [text[0].encode("ascii", "ignore").decode() for text in batch.gt_txt]
-        with torch.no_grad():
-            image_embeds = self.image_tokenizer.model.ln_vision(
-                self.image_tokenizer.model.visual_encoder(image)
-            )
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device)
-
-        query_tokens = self.image_tokenizer.model.query_tokens.expand(image_embeds.shape[0], -1, -1)
-
-        query_output = self.image_tokenizer.model.Qformer.bert(
-            query_embeds=query_tokens,
-            encoder_hidden_states=image_embeds,
-            encoder_attention_mask=image_atts,
-            use_cache=True,
-            return_dict=True,
-        )
-
-        image_feats = F.normalize(
-            self.image_tokenizer.model.vision_proj(
-                query_output.last_hidden_state), dim=-1
-        )
-
-        text_tokens = self.image_tokenizer.model.tokenizer(
-            text,
-            padding="max_length",
-            truncation=True,
-            max_length=128,
-            return_tensors="pt",
-        ).to(device)
-
-        text_output = self.image_tokenizer.model.Qformer.bert(
-            text_tokens.input_ids,
-            attention_mask=text_tokens.attention_mask,
-            return_dict=True,
-        )
-
-        text_feat = F.normalize(
-            self.image_tokenizer.model.text_proj(
-                text_output.last_hidden_state[:, 0, :]), dim=-1
-        )
-
-        ###============== Image-text Contrastive ===================###
-        sim_q2t = torch.matmul(
-            image_feats.unsqueeze(1), text_feat.unsqueeze(-1)
-        ).squeeze()
-        # [batch_size, batch_size*num_gpu, num_query_tokens]
-
-        # image-text similarity: aggregate across all query tokens
-        sim_i2t, _ = sim_q2t.max(-1)
-        sim_i2t = sim_i2t / self.image_tokenizer.model.temp
-
-        # text-query similarity: [batch_size, batch_size*num_gpu, num_query_tokens]
-        sim_t2q = torch.matmul(
-            text_feat.unsqueeze(1).unsqueeze(1), image_feats.permute(0, 2, 1)
-        ).squeeze()
-
-        # text-image similarity: aggregate across all query tokens
-        sim_t2i, _ = sim_t2q.max(-1)
-        sim_t2i = sim_t2i / self.image_tokenizer.model.temp  # [batch_size, batch_size*num_gpu]
-
-        bs = image.size(0)
-        targets = torch.arange(bs, dtype=torch.long).to(device)
-
-        loss_itc = (
-            F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
-            + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
-        ) / 2
-
-        self.log(
-                "train/loss_itc",
-                loss_itc,
-                on_step=True,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
-
-        return loss_itc
 
     def forward_stage_2(self,batch, batch_idx: int):
         """_summary_
@@ -482,12 +349,14 @@ class SEEDTrainingWrapper(LightningModule):
         #------------------------
         # Stage 2 Training
         #------------------------
-        img = self.transform_224(batch.img)
+        device = self.device
+        img = batch.img.to(device)
 
         #------------------------
         # Stage 2 - 1 : Codebook Training
         #------------------------
-        causal_embeddings = self.get_causal_embeddings(img)
+        with torch.no_grad():
+            causal_embeddings = self.get_causal_embeddings(img)
 
         # TODO: query_output should be trained to be similar with text embedding
         # Image embedding is cross attentioned.
@@ -535,8 +404,7 @@ class SEEDTrainingWrapper(LightningModule):
     
         loss_generation_embed = F.mse_loss(reverse_output_proj, gt_img_clip_embeddings)
 
-        #loss_total = loss_embed + loss_recon + loss_generation_embed
-        loss_total = loss_generation_embed + loss_recon + loss_generation_embed
+        loss_total = loss_embed + loss_recon + loss_generation_embed
         loss_total = loss_total.mean()
 
         # loss_dict = {"loss_embed": loss_embed, "loss_recon": loss_recon,
@@ -617,18 +485,8 @@ class SEEDTrainingWrapper(LightningModule):
     def training_step(self, batch, batch_idx: int):
         self.B = batch.img.shape[0]
         
-        # gt_text is a list of string
-        # Encoding text in list to ascii
-        #batch.gt_txt = [[text[0].encode("ascii", "ignore").decode()] for text in batch.gt_txt]
-
-        #stage_1_loss = self.get_stage_1_loss(batch, batch_idx)
-        
         stage_2_loss = self.get_stage_2_loss(batch, batch_idx)
         
-        # mock loss 1
-        #stage_2_loss = torch.tensor(0.1979, requires_grad=True)
-
-        #return stage_1_loss
         return stage_2_loss
 
     @torch.no_grad()
@@ -646,24 +504,69 @@ class SEEDTrainingWrapper(LightningModule):
                 latents=self.image_tokenizer.latents,
             ).images
             
-            # save image
-            if save_path is None:
-                save_path = f"{self.cfg.result_path}/{self.current_epoch}"
-            reconstructed_images[0].save(f"{save_path}/{image_id[0]}")
+        if self.logger is not None and isinstance(self.logger, pl_loggers.TensorBoardLogger):
+            tb_log_dir = self.logger.log_dir
+        else:
+            tb_log_dir = self.cfg.result_path
+        
+        save_path = f"{tb_log_dir}/images/version_{self.logger.version}/epoch_{self.current_epoch}/images"
+        os.makedirs(save_path, exist_ok=True)
 
-            # tensor_images = []
-            # for img in reconstructed_images:
-            #     tensor_images.append(self.pil_to_tensor(img).unsqueeze(0))
-            # tensor_images = torch.cat(tensor_images, dim=0)
+        tensor_images = []
+
+        for img, cur_id in zip(reconstructed_images, image_id):
+            # save PIL image to save_path
+            img.save(f"{save_path}/{cur_id}")
+
+            # For tensorboard logging
+            tensor_images.append(self.pil_to_tensor(img).unsqueeze(0))
+
+        tensor_images = torch.cat(tensor_images, dim=0)
+
+        # Check if image is already logged
+        if batch_idx not in self.logged_original_image:
+            self.logger.experiment.add_images(
+                f"original/image_batch_{batch_idx}",
+                image,
+            )
+
+            self.logger.experiment.add_images(
+                f"original/image_batch_{batch_idx}_seed_reconstructed",
+                tensor_images,
+            )
+
+            # logging original caption
+            for caption in captions:
+                self.logger.experiment.add_text(
+                    f"original/gt_text_image_batch_{batch_idx}",
+                    caption,
+                )
+
+            self.logged_original_image.add(batch_idx)
+        else:
+            self.logger.experiment.add_images(
+                f"images/image_batch_{batch_idx}",
+                tensor_images,
+                global_step=self.sample_image_ind,
+            )
+            self.sample_image_ind += 1
 
 
     def configure_optimizers(self):
         # optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, betas=(0.9, 0.999), weight_decay=1e-8)
-        optimizer = torch.optim.AdamW(self.parameters(), lr=1.5e-4, betas=(0.9, 0.999), weight_decay=1e-8)
+        lr = self.cfg.optimizer.max_lr
+        betas = (self.cfg.hyperparameters.beta1, self.cfg.hyperparameters.beta2)
+        weight_decay = self.cfg.hyperparameters.weight_decay
+        optimizer = torch.optim.AdamW(self.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
 
         #scheduler = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=100, num_training_steps=5000)
-        num_training_steps = self.cfg.experiment.max_epochs * (1000000 / 4 / 1024)
-        scheduler = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=100, num_training_steps=num_training_steps)
+        num_training_steps = self.cfg.experiment.total_training_steps
+        num_warmup_steps = self.cfg.experiment.num_warmup_steps
+        scheduler = transformers.get_cosine_schedule_with_warmup(
+            optimizer=optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps
+        )
 
 
         lr_scheduler_config = {
@@ -674,8 +577,7 @@ class SEEDTrainingWrapper(LightningModule):
         }
 
         return {"optimizer": optimizer,
-                "lr_scheduler": lr_scheduler_config,
-                "gradient_clip_val": self.cfg.optimizer.grad_clip_val,}
+                "lr_scheduler": lr_scheduler_config,}
         
     def on_validation_epoch_end(self):
         original_image_dir = '/ssd0/data/coco/images/val2014'
@@ -695,14 +597,39 @@ class SEEDTrainingWrapper(LightningModule):
             prog_bar=True,
             logger=True,
         )
+
+    def on_before_optimizer_step(self, optimizer, optimizer_idx):
+        # Compute the 2-norm for each layer
+        # If using mixed precision, the gradients are already unscaled here
+        # {'grad_2.0_norm/weight': 0.0003, 'grad_2.0_norm/bias': 0.0, 'grad_2.0_norm_total': 0.0003}
+        codebook_norm = grad_norm(self.image_tokenizer.model.quantize.embedding, norm_type=2)
+        for norm in codebook_norm.keys():
+            self.logger.experiment.add_scalar(
+                f"grad_norm/image_tokenizer/model/quantize/{norm}",
+                codebook_norm[norm],
+                global_step=self.global_step,
+            )
         
+        transformer_decoder_norm = grad_norm(self.image_tokenizer.model.blocks_image, norm_type=2)
+        for norm in transformer_decoder_norm.keys():
+            self.logger.experiment.add_scalar(
+                f"grad_norm/image_tokenizer/model/blocks_image/{norm}",
+                transformer_decoder_norm[norm],
+                global_step=self.global_step,
+            )
         
+        generation_mlp_norm = grad_norm(self.image_tokenizer.model.distill_image_proj, norm_type=2)
+        for norm in generation_mlp_norm.keys():
+            self.logger.experiment.add_scalar(
+                f"grad_norm/image_tokenizer/model/distill_image_proj/{norm}",
+                generation_mlp_norm[norm],
+                global_step=self.global_step,
+            )
 
 if __name__ == "__main__":
     cfg, cfg_yaml = build_config()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # cfg.tokenizer_cfg_path = "configs/tokenizer/seed_llama_tokenizer.yaml"
     seed_everything(cfg.experiment.seed, workers=True)
 
     transform_cfg = OmegaConf.load(cfg.transform_cfg_path)
@@ -722,9 +649,10 @@ if __name__ == "__main__":
     datamodule.setup()
     train_dataloader = datamodule.train_dataloader()
     #val_dataloader = datamodule.val_dataloader()
+    cfg.experiment.total_training_steps = int(cfg.experiment.max_epochs * (1000000 / 4 / 1024))
     
-    karpathy_file = '/ssd0/data/coco/annotations/karpathy/dataset_coco_test.json'
-    root_dir = '/ssd0/data/coco/images/val2014'
+    karpathy_file = cfg.karpathy_file_path
+    root_dir = cfg.root_dir
     start_index = 0
     end_index = 256
     val_dataset = CocoDataset(root_dir, karpathy_file, tokenizer=None, start_index=start_index, end_index=end_index)
@@ -737,27 +665,20 @@ if __name__ == "__main__":
         accelerator=device,
         num_nodes=cfg.dist.n_nodes,
         devices=cfg.dist.n_gpus,
-        strategy=DDPStrategy(
-            find_unused_parameters=True,
-            # ddp_comm_hook=default_hooks.fp16_compress_hook
-            # if cfg.optimizer.fp16_grad_comp
-            # else None,
-        ),
-        #strategy="ddp",
+        strategy="ddp",
+        find_unused_parameters=False,
         max_epochs=cfg.experiment.max_epochs,
         deterministic=True,
         logger=tb_logger,
-        log_every_n_steps=1,
+        log_every_n_steps=cfg.experiment.log_every_n_steps,
         # val_check_interval=cfg.experiment.val_check_interval,
-        # check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
+        check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
         enable_checkpointing=cfg.experiment.enable_checkpointing,
-        #enable_checkpointing=True,
-        # Debug
-        num_sanity_val_steps=0,
-        precision='bf16',
-        # overfit_batches=cfg.experiment.overfit_batches,
+        num_sanity_val_steps=cfg.experiment.num_sanity_val_steps,
+        precision=str(cfg.optimizer.precision),
         callbacks=[ModelSummary(max_depth=3), lr_logger],
-        accumulate_grad_batches=cfg.experiment.grad_accumulation
+        accumulate_grad_batches=cfg.experiment.grad_accumulation,
+        gradient_clip_val=cfg.optimizer.grad_clip_val,
     )
 
     wrapper = SEEDTrainingWrapper(cfg).to(device)
