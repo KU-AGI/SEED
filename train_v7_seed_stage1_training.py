@@ -33,8 +33,6 @@ from datamodules.tokenizers import TokenizerUtils
 from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
 import torch.nn.functional as F
 from pytorch_lightning.strategies import DDPStrategy, DDPFullyShardedStrategy
-import open_clip
-from info_nce import InfoNCE, info_nce
 from models.seed_llama_tokenizer import ImageTokenizer
 import transformers
 
@@ -102,7 +100,7 @@ class SEEDTrainingWrapper(LightningModule):
                             from_pretrained=True,
                             diffusion_model_path=cfg.checkpoint_path.diffusion_model_path,
                             load_diffusion=False,
-                            is_train_stage_1=True,
+                            is_train_stage_1=False if cfg.stage1.init == "SEED" else True,
                             )
 
         self.B = None
@@ -416,27 +414,17 @@ class SEEDTrainingWrapper(LightningModule):
         # Assume image_embeds.shape[0] is the batch size (b) and you have 32 tokens (n)
         b, n, _ = query_tokens.shape
 
-        # Step 1: Create a causal mask
-        # causal_mask = torch.triu(torch.ones((n, n), device=device) * float('-inf'), diagonal=1)
-        causal_mask = torch.triu(torch.ones((n, n), device=device), diagonal=1)
-        
-        # Step 2: Apply causal mask in attention
-        # Add a new dimension to the mask for the batch size and expand it to match the batch size
-        causal_mask = causal_mask.unsqueeze(0).expand(b, -1, -1)  # shape: [b, n, n]
-        
         query_output = self.image_tokenizer.model.Qformer.bert(
             query_embeds=query_tokens,
             encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_atts,
-            use_cache=True,
             return_dict=True,
-            # attention_mask=causal_mask,  # Apply causal mask here
         )
 
         # Use last hidden state
         # We have 32 tokens, and use last token as image embedding
         # [b, 32, 768]
-        image_feats = F.normalize(query_output.last_hidden_state, dim=1)
+        image_feats = F.normalize(query_output.last_hidden_state, dim=-1)
 
         text_tokens = self.image_tokenizer.model.tokenizer(
             text,
@@ -454,7 +442,7 @@ class SEEDTrainingWrapper(LightningModule):
 
         # CLS token
         # [b, 768]
-        text_feat = F.normalize(text_output.last_hidden_state[:, 0, :], dim=1)
+        text_feat = F.normalize(text_output.last_hidden_state[:, 0, :], dim=-1)
 
         ###============== Image-text Contrastive ===================###
 
@@ -474,10 +462,6 @@ class SEEDTrainingWrapper(LightningModule):
             # image_feats.unsqueeze(1), text_feat_all.unsqueeze(-1)
         ).squeeze()
         # [batch_size, batch_size*num_gpu, num_query_tokens]
-
-        # image-text similarity: Use last token
-        sim_i2t = sim_q2t[:, :, -1]
-        sim_i2t = sim_i2t / self.temp
 
         ########### 1. Debug: for check the similarity ############
         # Softmax for each row
@@ -541,10 +525,6 @@ class SEEDTrainingWrapper(LightningModule):
             # text_feat.unsqueeze(1).unsqueeze(1), image_feats_all.permute(0, 2, 1)
         ).squeeze()
 
-        # text-image similarity: Use last token
-        sim_t2i = sim_t2q[:, :, -1]
-        sim_t2i = sim_t2i / self.temp  # [batch_size, batch_size*num_gpu]
-
         # Debug: for check the similarity
         count_dict = {}
         for token_num in range(32):
@@ -596,22 +576,38 @@ class SEEDTrainingWrapper(LightningModule):
 
         plt.savefig(f"{save_dir}/token_histogram_text_image_batch{batch_idx}_rank{rank}.png")
 
+        loss_mean = 0
         rank = dist.get_rank()
         if rank == 0:
-            bs = image.size(0)
-            targets = torch.linspace(rank * bs, rank * bs + bs - 1, bs, dtype=int).to(
-                image.device
-            )
+            for token in range(32):
+                bs = image.size(0)
+                targets = torch.linspace(rank * bs, rank * bs + bs - 1, bs, dtype=int).to(
+                    image.device
+                )
 
-            loss_itc = (
-                F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
-                + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
-            ) / 2
-            print(f"Loss I2T: {loss_itc}")
+                sim_i2t = sim_q2t[:, :, token] / self.temp
+                sim_t2i = sim_t2q[:, :, token] / self.temp
 
+                loss_itc = (
+                    F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
+                    + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
+                ) / 2
+                print(f"Loss I2T in Token {token}: {loss_itc}")
+                loss_mean += loss_itc
+
+                self.log(
+                        f"val/loss_itc_{token}",
+                        loss_itc,
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=True,
+                        logger=True,
+                    )
+
+            loss_mean /= 32
             self.log(
-                    "val/loss_itc",
-                    loss_itc,
+                    "val/loss_itc_mean",
+                    loss_mean,
                     on_step=False,
                     on_epoch=True,
                     prog_bar=True,
@@ -643,27 +639,20 @@ class SEEDTrainingWrapper(LightningModule):
         # Assume image_embeds.shape[0] is the batch size (b) and you have 32 tokens (n)
         b, n, _ = query_tokens.shape
 
-        # Step 1: Create a causal mask
-        causal_mask = torch.triu(torch.ones((n, n), device=device) * float('-inf'), diagonal=1)
-        
-        # Step 2: Apply causal mask in attention
-        # Add a new dimension to the mask for the batch size and expand it to match the batch size
-        causal_mask = causal_mask.unsqueeze(0).expand(b, -1, -1)  # shape: [b, n, n]
-        
         query_output = self.image_tokenizer.model.Qformer.bert(
             query_embeds=query_tokens,
             encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_atts,
-            # use_cache=True,
             return_dict=True,
-            # attention_mask=causal_mask,  # Apply causal mask here
         )
 
         # Use last hidden state
         # We have 32 tokens, and use last token as image embedding
         # [b, 32, 768]
         # TODO: Use 'final' causal embedding? Does it mean to use last token embedding?
-        image_feats = F.normalize(query_output.last_hidden_state, dim=1)
+        # Debug
+        image_feats = rearrange(query_output.last_hidden_state[:, -1, :], "b d -> b 1 d").contiguous()
+        image_feats = F.normalize(image_feats, dim=-1)
 
         text_tokens = self.image_tokenizer.model.tokenizer(
             text,
@@ -681,7 +670,7 @@ class SEEDTrainingWrapper(LightningModule):
 
         # CLS token
         # [b, 768]
-        text_feat = F.normalize(text_output.last_hidden_state[:, 0, :], dim=1)
+        text_feat = F.normalize(text_output.last_hidden_state[:, 0, :], dim=-1)
 
         ###============== Image-text Contrastive ===================###
         # Compute for each query token
@@ -704,7 +693,10 @@ class SEEDTrainingWrapper(LightningModule):
         # [batch_size, batch_size*num_gpu, num_query_tokens]
 
         # Always use last token
-        sim_i2t = sim_q2t[:, :, -1]
+        # sim_i2t = sim_q2t[:, :, -1]
+        sim_i2t = sim_q2t
+        # Debug : Test Original BLIP-2 loss
+        # sim_i2t, _ = sim_q2t.max(-1)
         sim_i2t = sim_i2t / self.temp
 
         # text-query similarity: [batch_size, batch_size*num_gpu, num_query_tokens]
@@ -714,7 +706,10 @@ class SEEDTrainingWrapper(LightningModule):
         # [batch_size, batch_size*num_gpu, num_query_tokens]
 
         # Always use last token
-        sim_t2i = sim_t2q[:, :, -1]
+        # sim_t2i = sim_t2q[:, :, -1]
+        sim_t2i = sim_t2q
+        # Debug : Test Original BLIP-2 loss
+        # sim_t2i, _ = sim_t2q.max(-1)
         sim_t2i = sim_t2i / self.temp  # [batch_size, batch_size*num_gpu]
 
         rank = dist.get_rank()
@@ -910,10 +905,13 @@ class SEEDTrainingWrapper(LightningModule):
             weight_decay=self.cfg.hyperparameters.weight_decay,)
 
         total_training_steps = self.cfg.experiment.total_training_steps
+        print(f"Traing steps in one epoch: {total_training_steps // self.cfg.experiment.max_epochs}")
+        print(f"Total training steps: {total_training_steps}")
 
         scheduler = transformers.get_cosine_schedule_with_warmup(
             optimizer=optimizer,
-            num_warmup_steps=total_training_steps * 0.03,
+            # num_warmup_steps=total_training_steps * 0.03,
+            num_warmup_steps=self.cfg.experiment.num_warmup_steps,
             num_training_steps=total_training_steps,
             )
 
@@ -1005,7 +1003,8 @@ if __name__ == "__main__":
     datamodule.setup()
     train_dataloader = datamodule.train_dataloader()
     # cfg.experiment.total_training_steps = int((len(train_dataloader) * cfg.experiment.max_epochs) / (cfg.dist.n_gpus * cfg.experiment.grad_accumulation))
-    cfg.experiment.total_training_steps = int(553 * cfg.experiment.max_epochs)
+    # cfg.experiment.total_training_steps = int(557 * cfg.experiment.max_epochs)
+    cfg.experiment.total_training_steps = int(279 * cfg.experiment.max_epochs)
 
     # Set Validation Dataset
     karpathy_file = cfg.karpathy_file_path
@@ -1039,13 +1038,13 @@ if __name__ == "__main__":
 
     wrapper = SEEDTrainingWrapper(cfg).to(device)
     wrapper = SEEDTrainingWrapper.load_from_checkpoint(
-        "/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_50_stage_1_final_token_init_weight_new_version/checkpoints/epoch=31-step=25024.ckpt",
-        # "/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_61_load_from_60/checkpoints/epoch=2-step=1656.ckpt",
+        "/home/ubuntu/Projects/SEED_Tokenizer/logs/seed_stage_1_training_debug_aica/lightning_logs/version_21/checkpoints/epoch=9-step=2780.ckpt",
         cfg=cfg).to(device)
+
     wrapper.setup("fit")
 
     trainer.fit(
         wrapper, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader,
-        # ckpt_path="/home/zheedong/Projects/SEED/logs/seed_stage_1_training_debug/lightning_logs/version_60_resume_from_55/checkpoints/epoch=5-step=3427.ckpt"
+        # ckpt_path="/home/ubuntu/Projects/SEED_Tokenizer/logs/seed_stage_1_training_debug_aica/lightning_logs/version_10_warmup_2000_steps/checkpoints/epoch=1-step=1112.ckpt"
     )
     trainer.strategy.barrier()
