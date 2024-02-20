@@ -18,7 +18,64 @@ from einops import rearrange
 from .blip2 import Blip2Base, disabled_train
 from .vit import Block
 from .utils import download_cached_file, is_url
+from typing import Tuple
 import pdb
+class EMAVectorQuantizer(nn.Module):
+    """
+    EMAVectorQuantizer
+    """
+    def __init__(self,
+                 dim: int,
+                 n_embed: int,
+                 beta: float,
+                 decay: float = 0.99,
+                 eps: float = 1e-5) -> None:
+        super().__init__()
+        self.n_embed = n_embed
+        self.dim = dim
+        self.beta = beta
+        self.decay = decay
+        self.eps = eps
+
+        embedding = torch.randn(n_embed, dim)
+        self.register_buffer("embedding", embedding)
+        self.register_buffer("cluster_size", torch.zeros(self.n_embed))
+        self.register_buffer("embedding_avg", embedding.clone())
+
+    def forward(self,
+                z: torch.FloatTensor) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.LongTensor]:
+        z = rearrange(z, 'b c h w -> b h w c').contiguous()  # [B,C,H,W] -> [B,H,W,C]
+        z_flattened = z.view(-1, self.dim)
+
+        d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
+            torch.sum(self.embedding**2, dim=1) - 2 * \
+            torch.einsum('bd,dn->bn', z_flattened, rearrange(self.embedding, 'n d -> d n'))
+
+        min_encoding_indices = torch.argmin(d, dim=1)
+        z_q = F.embedding(min_encoding_indices, self.embedding).view(z.shape)
+        embed_onehot = F.one_hot(min_encoding_indices, self.n_embed).type(z_flattened.dtype)
+
+        if self.training:
+            embed_onehot_sum = embed_onehot.sum(0)
+            embed_sum = embed_onehot.transpose(0, 1) @ z_flattened
+
+            dist_fn.all_reduce(embed_onehot_sum, op=dist_fn.ReduceOp.SUM)
+            dist_fn.all_reduce(embed_sum, op=dist_fn.ReduceOp.SUM)
+
+            self.cluster_size.data.mul_(self.decay).add_(embed_onehot_sum, alpha=1 - self.decay)
+            self.embedding_avg.data.mul_(self.decay).add_(embed_sum, alpha=1 - self.decay)
+
+            n = self.cluster_size.sum()
+            cluster_size = (self.cluster_size + self.eps) / (n + self.n_embed * self.eps) * n
+            embed_normalized = self.embedding_avg / cluster_size.unsqueeze(1)
+
+            self.embedding.data.copy_(embed_normalized)
+
+        diff = self.beta * torch.mean((z_q.detach() - z) ** 2)
+        z_q = z + (z_q - z).detach()
+        z_q = rearrange(z_q, 'b h w c -> b c h w').contiguous()
+
+        return z_q, diff, min_encoding_indices
 
 class VectorQuantizer2(nn.Module):
     """
@@ -226,7 +283,8 @@ class Blip2QformerQuantizer(Blip2Base):
             param.requires_grad = is_train
         self.query_tokens.requires_grad = is_train
 
-        self.quantize = VectorQuantizer2(n_embed, codebook_embed_dim, beta=0.25, remap=None, sane_index_shape=False)
+        self.quantize = VectorQuantizer2(n_embed, codebook_embed_dim, beta=0.25, remap=None, sane_index_shape=False, legacy=False)
+        # self.quantize = EMAVectorQuantizer(codebook_embed_dim, n_embed, beta=0.25)
 
         # 768 => 32
         self.encode_task_layer = nn.Sequential(

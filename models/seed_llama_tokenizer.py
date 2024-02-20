@@ -29,34 +29,26 @@ class ImageTokenizer(nn.Module):
                  load_diffusion=False,
                  image_size=224,
                  device='cuda',
-                 fp16=True,
                  from_pretrained=True,
-                 is_train_stage_1=False,
+                 vit_precision='fp16',
+                 diffusion_precision='fp16',
                  **kwargs):
         super().__init__()
         from .seed_qformer.qformer_quantizer import Blip2QformerQuantizer
         if not from_pretrained:
-            model = Blip2QformerQuantizer(vit_precision='fp16' if fp16 else 'fp32', is_train=True, **kwargs)
-        elif is_train_stage_1:
-            print('Load from BERT Weights')
-            model = Blip2QformerQuantizer.from_pretrained_debug(pretrained_model_path=model_path,
-                                                        #vit_precision='fp16' if fp16 else 'fp32',
-                                                        vit_precision='bf16',
-                                                        is_train=True,
-                                                        **kwargs)#.eval()
+            model = Blip2QformerQuantizer(vit_precision=vit_precision, is_train=True, **kwargs)
         else:
             model = Blip2QformerQuantizer.from_pretrained(pretrained_model_path=model_path,
                                                         #vit_precision='fp16' if fp16 else 'fp32',
-                                                        vit_precision='bf16',
-                                                        is_train=False,
+                                                        vit_precision=vit_precision,
+                                                        is_train=True,
                                                         **kwargs)
 
         if diffusion_model_path is not None and load_diffusion:
             # diffusion_model = DiffusionPipeline.from_pretrained(diffusion_model_path,
             #                                                     torch_dtype=torch.float16 if fp16 else torch.float32)
             diffusion_model = StableUnCLIPImg2ImgPipeline.from_pretrained(diffusion_model_path,
-                                                                          #torch_dtype=torch.float16 if fp16 else torch.float32
-                                                                          torch_dtype=torch.bfloat16)
+                                                                          torch_dtype=dict(fp16=torch.float16, fp32=torch.float32)[diffusion_precision])
         else:
             diffusion_model = None
             self.diffusion_model = None
@@ -84,7 +76,7 @@ class ImageTokenizer(nn.Module):
             self.diffusion_model = diffusion_model
         self.processor = processor
         self.device = device
-        self.fp16 = fp16
+        self.fp16 = vit_precision == 'fp16'
 
     def __len__(self):
         return self.model.n_embed

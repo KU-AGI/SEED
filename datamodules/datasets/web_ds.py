@@ -36,7 +36,8 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
              "coco", "cc15m_vg_sbu", "cc15m_vg_sbu_kb100m", "cc15m_vg_sbu_signals17m",
              "coco2014", "cc3m_coco", "mscoco", "mscoco_debug",
              "cc3m_coco_laion_coco",  "cc3m_coco_laion_coco2", "cc3m_coco_laion_coco3",
-             "cc15m_3m_laion400M_karpathy"}
+             "cc15m_3m_laion400M_karpathy",
+             "debug"}
     splits = {"train", "val"}
     locs = {"bcloud", "gcp"}
     urls_info = {
@@ -229,7 +230,13 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
         ),
         ("cc3m_coco_laion_coco3", "bcloud", "val",): (
             "/ssd0/data/coco_karpathy/train/{00000..00056}.tar"
-        )
+        ),
+        ("debug", "bcloud", "train",): (
+            "/ssd0/data/cc3m_filtered_v3/{00000..00331}_filtered.tar",
+        ),
+        ("debug", "bcloud", "val",): (
+            "/ssd0/data/coco_karpathy/train/{00000..00056}.tar"
+        ),
         
     }
 
@@ -417,6 +424,12 @@ class WebDatasetPartitionedShard(IterableDataset, TokenizerUtils):
                 ret = 1000000
             else:
                 ret = 560000
+            return ret
+        elif name == 'debug':
+            if split == "train":
+                ret = 40000
+            else:
+                ret = 10000
             return ret
         else:
             raise ValueError()

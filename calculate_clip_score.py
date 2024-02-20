@@ -3,6 +3,7 @@ import open_clip
 import torch
 from PIL import Image
 from tqdm import tqdm
+from glob import glob
 
 from transformers import CLIPProcessor, CLIPModel
 
@@ -23,12 +24,13 @@ def calculate_clip_s(origial_image_path, generated_image_path, model_clip, prepr
 
 def calculate_clip_s_for_folder(original_image_folder, generated_image_folder):
     s_list = []
-    file_list = os.listdir(generated_image_folder)
+    file_list = glob(os.path.join(generated_image_folder, '*.jpg'))
     #model_clip, _,  preprocess_clip = open_clip.create_model_and_transforms('ViT-L-14', device='cuda')
     model_clip = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").cuda()
     preprocess_clip = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
     for i, file in enumerate(tqdm(file_list)):
+        file = os.path.basename(file)
         original_image_path = os.path.join(original_image_folder, file)
         generated_image_path = os.path.join(generated_image_folder, file)
         s = calculate_clip_s(original_image_path, generated_image_path, model_clip, preprocess_clip)
