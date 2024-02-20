@@ -4,14 +4,9 @@
 conda env create -f seed.yaml
 ``` 
 
-## SD Overfitting
+## SEED Tokenizer Training
 ```bash
-sh train_sd_overfit.sh
-``` 
-
-## SEED Overfitting
-```bash
-sh train_seed_overfit.sh
+CUDA_VISIBLE_DEVICES=0 python train_v7_unified.py cfg_path=configs/seed_unified_test.yaml
 ``` 
 
 # Original README
