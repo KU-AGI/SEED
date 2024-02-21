@@ -295,14 +295,8 @@ class SEEDTrainingWrapper(LightningModule):
             quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
             embed_ind = embed_ind.reshape(quant.shape[0], -1)
 
-
-        # # [b, 32, 32] => [b, 32, 768]
+        # [b, 32, 32] => [b, 32, 768]
         query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
-
-        quant_embedding = self.image_tokenizer.model.quantize.get_codebook_entry(embed_ind)
-
-        # # [b, 32, 32] => [b, 32, 768]
-        query_output_up = self.image_tokenizer.model.decode_task_layer(quant_embedding)
 
         # [b, 32, 768] => [b, 32, 768]
         query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
