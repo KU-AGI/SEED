@@ -41,6 +41,7 @@ stage2:
   load_diffusion: True
   vq:
     type: 'vq2' # ['vq2', 'ema_vq', nsvq']
+    replace_codes: True
     replacement_num_batches: 1000
     discarding_threshold: 0.01
 
