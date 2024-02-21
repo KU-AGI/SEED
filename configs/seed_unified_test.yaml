@@ -39,6 +39,10 @@ stage1:
 stage2:
   bypass_codebook: False
   load_diffusion: True
+  vq:
+    type: 'vq2' # ['vq2', 'ema_vq', nsvq']
+    replacement_num_batches: 1000
+    discarding_threshold: 0.01
 
 experiment:
   seed: 0
