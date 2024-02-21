@@ -856,7 +856,7 @@ class SEEDTrainingWrapper(LightningModule):
         # codebook replacement
         replacement_num_batches = self.cfg.stage2.vq.replacement_num_batches
         #if ((self.global_step + 1) % replacement_num_batches == 0) & (self.global_step <= replacement_num_batches - 2 * replacement_num_batches):
-        if ((batch_idx + 1) % replacement_num_batches == 0) & (self.cfg.stage2.vq.type == 'nsvq'):
+        if ((batch_idx + 1) % replacement_num_batches == 0):
             num_replaced_codebook = self.image_tokenizer.model.quantize.replace_unused_codebooks(replacement_num_batches)
         else:
             num_replaced_codebook = -1

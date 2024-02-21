@@ -90,7 +90,8 @@ class VectorQuantizer2(nn.Module):
     # NOTE: due to a bug the beta term was applied to the wrong term. for
     # backwards compatibility we use the buggy version by default, but you can
     # specify legacy=False to fix it.
-    def __init__(self, n_e, e_dim, beta, remap=None, unknown_index="random", sane_index_shape=False, legacy=True):
+    def __init__(self, n_e, e_dim, beta, remap=None, unknown_index="random", sane_index_shape=False, legacy=True,
+                 device=torch.device('cpu'), discarding_threshold=0.01):
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
@@ -114,6 +115,13 @@ class VectorQuantizer2(nn.Module):
             self.re_embed = n_e
 
         self.sane_index_shape = sane_index_shape
+
+        self.codebooks_used = torch.zeros(self.n_e, dtype=torch.int32, device=device)
+
+        self.device = device
+        self.discarding_threshold = discarding_threshold
+        self.eps = 1e-12
+
 
     def remap_to_used(self, inds):
         ishape = inds.shape
@@ -179,6 +187,9 @@ class VectorQuantizer2(nn.Module):
         avg_probs = torch.mean(encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-12)))
 
+        with torch.no_grad():
+            self.codebooks_used[min_encoding_indices] += 1
+
         if self.remap is not None:
             min_encoding_indices = min_encoding_indices.reshape(z.shape[0], -1)  # add batch axis
             min_encoding_indices = self.remap_to_used(min_encoding_indices)
@@ -205,6 +216,64 @@ class VectorQuantizer2(nn.Module):
             z_q = z_q.permute(0, 3, 1, 2).contiguous()
 
         return z_q
+
+    def replace_unused_codebooks(self, num_batches):
+
+        """
+        This function is used to replace the inactive codebook entries with the active ones, to make all codebooks
+        entries to be used for training. The function has to be called periodically with the periods of "num_batches".
+        For more details, the function waits for "num_batches" training batches and then discards the codebook entries
+        which are used less than a specified percentage (self.discard_threshold) during this period, and replace them
+        with the codebook entries which were used (active).
+
+        Recommendation: Call this function after a specific number of training batches. In the beginning the number of
+         replaced codebooks might increase. However, the main trend must be decreasing after some training time.
+         If it is not the case for you, increase the "num_batches" or decrease the "discarding_threshold" to make
+         the trend for number of replacements decreasing. Stop calling the function at the latest stages of training
+         in order not to introduce new codebook entries which would not have the right time to be tuned and optimized
+         until the end of training.
+
+        Play with "self.discard_threshold" value and the period ("num_batches") you call the function. A common trend
+        could be to select the self.discard_threshold from the range [0.01-0.1] and the num_batches from the set
+        {100,500,1000,...}. For instance, as a commonly used case, if we set the self.discard_threshold=0.01 and
+        num_batches=100, it means that you want to discard the codebook entries which are used less than 1 percent
+        during 100 training batches. Remember you have to set the values for "self.discard_threshold" and "num_batches"
+        in a logical way, such that the number of discarded codebook entries have to be in a decreasing trend during
+        the training phase.
+
+        :param num_batches: period of training batches that you want to replace inactive codebooks with the active ones
+
+        """
+
+        with torch.no_grad():
+
+            unused_indices = torch.where((self.codebooks_used.cpu() / num_batches) < self.discarding_threshold)[0]
+            used_indices = torch.where((self.codebooks_used.cpu() / num_batches) >= self.discarding_threshold)[0]
+
+            unused_count = unused_indices.shape[0]
+            used_count = used_indices.shape[0]
+
+            if used_count == 0:
+                print(f'####### used_indices equals zero / shuffling whole codebooks ######')
+                self.embedding.weight += self.eps * torch.randn(self.embedding.weight.size(), device=self.device).clone()
+            else:
+                used = self.embedding.weight[used_indices].clone()
+                if used_count < unused_count:
+                    used_codebooks = used.repeat(int((unused_count / (used_count + self.eps)) + 1), 1)
+                    used_codebooks = used_codebooks[torch.randperm(used_codebooks.shape[0])]
+                else:
+                    used_codebooks = used
+
+                self.embedding.weight[unused_indices] *= 0
+                self.embedding.weight[unused_indices] += used_codebooks[range(unused_count)] + self.eps * torch.randn(
+                    (unused_count, self.e_dim), device=self.device).clone()
+
+            print(f'************* Replaced ' + str(unused_count) + f' codebooks *************')
+            self.codebooks_used[:] = 0.0
+
+        return unused_count
+
+
 
 
 class NSVQ(VectorQuantizer2):
@@ -446,13 +515,16 @@ class Blip2QformerQuantizer(Blip2Base):
         self.query_tokens.requires_grad = is_train
 
         if vq_type == "vq2":
-            self.quantize = VectorQuantizer2(n_embed, codebook_embed_dim, beta=0.25, remap=None, sane_index_shape=False, legacy=False)
+            self.quantize = VectorQuantizer2(n_embed, codebook_embed_dim, beta=0.25, remap=None, sane_index_shape=False, legacy=False,
+                                             device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+                                             discarding_threshold=discarding_thre,
+                                            )
         elif vq_type == "ema_vq":
             self.quantize = EMAVectorQuantizer(codebook_embed_dim, n_embed, beta=0.25)
         elif vq_type == "nsvq":
             self.quantize = NSVQ(n_embed, codebook_embed_dim, beta=0.25, remap=None, sane_index_shape=False,
                                  legacy=False, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-                                 discarding_threshold=discarding_thre, initialization='normal')
+                                 discarding_threshold=discarding_thre, initialization='uniform')
         else:
             raise NotImplementedError
         # 768 => 32
