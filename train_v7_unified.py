@@ -91,6 +91,8 @@ class SEEDTrainingWrapper(LightningModule):
             model_path=cfg.checkpoint_path.model_path,
             diffusion_model_path=cfg.checkpoint_path.diffusion_model_path,
             load_diffusion=cfg.stage2.load_diffusion,
+            vq_type=cfg.stage2.vq.type,
+            discarding_threshold=cfg.stage2.vq.discarding_threshold,
             from_pretrained=True if cfg.stage1.init == "SEED" else False,
             vit_precision=cfg.optimizer.vit_precision,
             diffusion_precision=cfg.optimizer.diffusion_precision,
@@ -292,7 +294,7 @@ class SEEDTrainingWrapper(LightningModule):
         else:
             # Quantize
             print("Quantize")
-            quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
+            quant, loss_embed, embed_ind, perplexity = self.image_tokenizer.model.quantize(query_output_down)
             embed_ind = embed_ind.reshape(quant.shape[0], -1)
 
         # [b, 32, 32] => [b, 32, 768]
@@ -343,6 +345,26 @@ class SEEDTrainingWrapper(LightningModule):
             prog_bar=True,
             logger=True,
         )
+
+        if "perplexity" in loss_dict.keys():
+            self.log(
+                "train/codebook_perplexity",
+                loss_dict["perplexity"].mean(),
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+
+        if "num_replaced_codebook" in loss_dict.keys():
+            self.log(
+                "train/num_replaced_codebook",
+                loss_dict["num_replaced_codebook"],
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
     
     def all_gather_with_grad(self, tensors):
         """
@@ -822,8 +844,16 @@ class SEEDTrainingWrapper(LightningModule):
         query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
 
         # quant [b, 32, 32], loss_embed [b, 32, 768], embed_ind [b, 32]
-        quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
-        
+
+        quant, loss_embed, embed_ind, perplexity = self.image_tokenizer.model.quantize(query_output_down)
+
+        # codebook replacement
+        replacement_num_batches = self.cfg.stage2.vq.replacement_num_batches
+        #if ((self.global_step + 1) % replacement_num_batches == 0) & (self.global_step <= replacement_num_batches - 2 * replacement_num_batches):
+        if ((batch_idx + 1) % replacement_num_batches == 0) & self.cfg.stage2.vq.replace_codes:
+            num_replaced_codebook = self.image_tokenizer.model.quantize.replace_unused_codebooks(replacement_num_batches)
+        else:
+            num_replaced_codebook = -1
         #------------------------
         # Stage 2 - 2 : Reconstruction Caual Embedding
         #------------------------
@@ -854,7 +884,12 @@ class SEEDTrainingWrapper(LightningModule):
     
         loss_generation_embed = F.mse_loss(reverse_output_proj, gt_img_clip_embeddings)
 
-        loss_total = loss_embed + loss_recon + loss_generation_embed
+        loss_total = loss_recon + loss_generation_embed
+        # For NSVQ, codebook loss (loss_embed) should be used only for logging
+        if self.cfg.stage2.vq.type != 'nsvq':
+            loss_total += loss_embed
+
+
         loss_total = loss_total.mean()
 
         # loss_dict = {"loss_embed": loss_embed, "loss_recon": loss_recon,
@@ -864,7 +899,11 @@ class SEEDTrainingWrapper(LightningModule):
         loss_dict = {"loss_generation_embed": loss_generation_embed,
                      "loss_embed": loss_embed,
                      "loss_recon": loss_recon,
-                     "loss": loss_total}
+                     "loss": loss_total,
+                     "perplexity": perplexity,
+                     }
+        if num_replaced_codebook > 0:
+            loss_dict["num_replaced_codebook"] = num_replaced_codebook
 
         #------------------------
         # Logging
@@ -1115,7 +1154,8 @@ if __name__ == "__main__":
         # val_check_interval=cfg.experiment.val_check_interval,
         check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
         enable_checkpointing=cfg.experiment.enable_checkpointing,
-        num_sanity_val_steps=cfg.experiment.num_sanity_val_steps,
+        #num_sanity_val_steps=cfg.experiment.num_sanity_val_steps,
+        num_sanity_val_steps=0,
         precision=str(cfg.optimizer.precision),
         callbacks=[ModelSummary(max_depth=3), lr_logger] + [checkpoint_callback] if cfg.experiment.enable_checkpointing else [],
         accumulate_grad_batches=cfg.experiment.grad_accumulation,
