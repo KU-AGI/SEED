@@ -14,11 +14,11 @@ import tarfile
 
 class CompressionDataset(Dataset):
     def __init__(self, compression_level, transform=None):
-        self.root = '/home/zheedong/Projects/SEED/data/cc3m_CapsFusion'
+        self.root = '/home/zheedong/Projects/SEED/data/cc3m_llava_long_caption'
 
         self.annotation_path = f"{self.root}/annotations/{compression_level}/captions.json"
 
-        self.image_root = '/home/zheedong/Projects/SEED/data/cc3m_CapsFusion/images'
+        self.image_root = f"{self.root}/images"
 
         with open(self.annotation_path, encoding='utf-8') as f:
             self.annotation_data = json.load(f)

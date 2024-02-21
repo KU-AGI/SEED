@@ -17,7 +17,7 @@ dist:
 
 dataset:
   type: webdataset
-  name: cc3m_coco_laion_coco3
+  name: cc3m_coco_laion_coco
   loc: bcloud
   num_workers: 8
   shuffle: True
@@ -30,7 +30,7 @@ dataset:
     type: dalle-vqvae
     hparams:
       resolution: 256
-  gt_text: True
+  gt_text: Trueq
 
 stage1:
   ema_update: False
@@ -44,7 +44,7 @@ experiment:
   
   val_batch_size: 1
   test_split: train
-  max_epochs: 60
+  max_epochs: 40
   grad_accumulation: 1
   val_check_interval: 1
   check_val_every_n_epoch: 1

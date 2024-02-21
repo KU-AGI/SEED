@@ -1,19 +1,9 @@
 import os
 from typing import Any, List
-import torch
-from torch.cuda.amp import autocast
-import torch.nn as nn
-from torch.nn import functional as F
-from torch.optim.optimizer import Optimizer
-
 from tqdm import tqdm
 import time
 import json
-
 import argparse
-
-import argparse
-import time
 
 import hydra
 import torchvision.transforms as transforms
@@ -23,17 +13,10 @@ import numpy as np
 from omegaconf import OmegaConf
 from PIL import Image
 import PIL
-from torchvision.transforms.functional import to_pil_image
 from utils.config import build_config
 import pyrootutils
 from datamodules import build_datamodule
-from datamodules.tokenizers import TokenizerUtils
 
-from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
-import torch.nn.functional as F
-from pytorch_lightning.strategies import DDPStrategy, DDPFullyShardedStrategy
-import open_clip
-from info_nce import InfoNCE, info_nce
 from models.seed_llama_tokenizer import ImageTokenizer, ImageTokenizer2
 import transformers
 
@@ -45,16 +28,13 @@ from pytorch_lightning.utilities import grad_norm
 
 from typing import Any, Callable, Dict, List, Optional, Union
 
-import numpy as np
-from PIL import Image
-import pdb
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 from torch.cuda.amp import custom_bwd, custom_fwd
 from collections import OrderedDict
+from calculate_clip_score import calculate_clip_s_for_folder
+from datamodules.stage2_datamodule import DataModule
 
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
@@ -83,6 +63,8 @@ class SpecifyGradient(torch.autograd.Function):
         (gt_grad,) = ctx.saved_tensors
         gt_grad = gt_grad * grad_scale
         return gt_grad, None
+
+
 
 class SEEDTrainingWrapper(LightningModule):
     """Training wrapper for SEED
@@ -173,7 +155,7 @@ class SEEDTrainingWrapper(LightningModule):
             param.requires_grad = False
         # In this case, unet is frozen
         for param in self.image_tokenizer.diffusion_model.unet.parameters():
-            param.requires_grad = True
+            param.requires_grad = False
         for param in self.image_tokenizer.diffusion_model.vae.parameters():
             param.requires_grad = False
 
@@ -288,38 +270,6 @@ class SEEDTrainingWrapper(LightningModule):
         reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
 
         return reverse_output_proj, loss_embed, embed_ind
-
-
-    def get_stage_2_loss(self, batch, batch_idx: int, is_validation=False):
-        """_summary_
-
-        Args:
-            batch (_type_): _description_
-            batch_idx (int): _description_
-        """        
-        #------------------------
-        # Stage 2 Training
-        #------------------------
-
-        #------------------------
-        # Stage 2 - 1 : Codebook Training
-        #------------------------
-        quant, loss_embed, embed_ind = self.get_stage2_quant(batch)
-
-        gt_img_clip_embeddings = self.get_clip_img_embedding(batch.img)
-        
-        loss = F.mse_loss(quant, gt_img_clip_embeddings)
-
-        #------------------------
-        # Logging
-
-        if not is_validation:
-            self.logging_train(quant, loss_embed, gt_img_clip_embeddings, loss)
-        else:
-            self.logging_val(quant, loss_embed, gt_img_clip_embeddings, loss)
-            self.sample_embed_ind = embed_ind.reshape(self.B, -1)
-
-        return loss + loss_embed.mean()
 
     def train_diffusion(
         self,
@@ -553,38 +503,6 @@ class SEEDTrainingWrapper(LightningModule):
 
         return loss
 
-    def get_stage_diffusion_loss(self, batch, batch_idx: int, is_validation=False):
-        clip_size_image = self.transform_224(batch.img)
-        # For cosine similarity logging
-        gt_img_clip_embeddings = self.get_clip_img_embedding(clip_size_image.float())
-        image_embeds, _, _ = self.get_original_stage2_quant(clip_size_image)
-
-        loss_sds = self.sds(
-            image_embeds=image_embeds,
-            clean_image=clip_size_image.float(),
-            guidance_scale=10,
-            grad_scale=1,
-        )
-
-        self.log(
-            "train/loss_sds",
-            loss_sds,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "train/generation_embedding_clip_cosine_similarity",
-            F.cosine_similarity(image_embeds, gt_img_clip_embeddings).mean(),
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
-
-        return loss_sds, image_embeds
-
     def logging_train(self, quant, loss_embed, gt_img_clip_embeddings, loss):
         self.log(
             "train/generation_embed_loss",
@@ -612,7 +530,108 @@ class SEEDTrainingWrapper(LightningModule):
             prog_bar=True,
             logger=True,
         )
-    
+
+
+    def diff_loss(
+        self,
+        image_embeds,
+        clean_image,
+        guidance_scale=100,
+        grad_scale=1,
+        prompt=None,
+        prompt_embeds=None,
+    ):
+        """Score distillation sampling"""
+        if prompt is None and prompt_embeds is None:
+            # prompt = len(image) * [""] if isinstance(image, list) else ""
+            # Changed because we get image_embeds as input
+            prompt = image_embeds.shape[0] * [""] if isinstance(image_embeds, torch.Tensor) else ""
+
+        # 2. Define call parameters
+        batch_size = image_embeds.shape[0]
+
+        device = image_embeds.device
+
+        do_classifier_free_guidance = False
+
+        # Convert images to latent space
+        # latents = self.vae.encode(clean_image).latent_dist.sample()
+        # latents = latents * self.vae.config.scaling_factor
+
+        # 3. Encode input prompt
+
+        # [b, 77, 1024]
+        # Now img2img, prompt_embeds is None
+        prompt_embeds = self.image_tokenizer.diffusion_model._encode_prompt(
+            prompt=prompt,
+            device=device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            negative_prompt=None,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=None,
+            lora_scale=None,
+        )
+
+        image_embeds = self.image_tokenizer.diffusion_model._encode_image(
+            image=None,
+            device=device,
+            batch_size=batch_size,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            noise_level=0,
+            generator=None,
+            image_embeds=image_embeds,
+            negative_image_embeds=None,
+        )
+
+        latents = self.vae.encode(clean_image).latent_dist.sample()
+        latents = latents * self.vae.config.scaling_factor
+
+        # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
+        t = torch.randint(
+            self.min_step, self.max_step + 1, (batch_size,), dtype=torch.long, device=device
+        )
+
+        # add noise
+        noise = torch.randn_like(latents)
+        latents_noisy = self.scheduler.add_noise(latents, noise, t)
+
+        # pred noise
+        if do_classifier_free_guidance:
+            latents_noisy = torch.cat([latents_noisy] * 2)
+            t = torch.cat([t] * 2)
+
+        model_pred = self.unet(
+                latents_noisy,
+                t,
+                encoder_hidden_states=prompt_embeds,
+                class_labels=image_embeds,
+                return_dict=False,
+            )[0]
+        target = noise
+        if do_classifier_free_guidance:
+            target = torch.cat([noise] * 2)
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+        # noise_pred = self.unet(
+        #     latent_model_input,
+        #     t,
+        #     encoder_hidden_states=prompt_embeds,
+        #     class_labels=image_embeds,
+        # ).sample
+        #
+        # # perform guidance (high scale from paper!)
+        # noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        #
+        # noise_pred = noise_pred_uncond + guidance_scale * (
+        #         noise_pred_text - noise_pred_uncond
+        # )
+        #
+        # loss = 0.5 * F.mse_loss(noise_pred, latents.float(), reduction='mean')
+
+        return loss
+
     def sds(
         self,
         image_embeds,
@@ -773,7 +792,14 @@ class SEEDTrainingWrapper(LightningModule):
         # MLP
         image_embeds = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
 
-        loss_sds = self.sds(
+        # loss_sds = self.sds(
+        #     image_embeds=image_embeds,
+        #     clean_image=clip_size_image.float(),
+        #     guidance_scale=10,
+        #     grad_scale=1,
+        # )
+
+        loss_sds = self.diff_loss(
             image_embeds=image_embeds,
             clean_image=clip_size_image.float(),
             guidance_scale=10,
@@ -829,12 +855,13 @@ class SEEDTrainingWrapper(LightningModule):
 
         return loss
 
+    @torch.no_grad()
     def validation_step(self, batch, batch_idx: int):
-        image = self.transform_224(batch.img)
+        image, captions, image_id = batch
+        gt_img_clip_embeddings = self.get_clip_img_embedding(image.float())
 
-        with torch.no_grad():
-            gt_img_clip_embeddings = self.get_clip_img_embedding(image.float())
-            image_embeds, _, _ = self.get_original_stage2_quant(image)
+        image = self.transform_224(image)
+        image_embeds, _, _ = self.get_original_stage2_quant(image)
 
         self.log(
             "valid/clip_cosine_similarity",
@@ -845,14 +872,21 @@ class SEEDTrainingWrapper(LightningModule):
             logger=True,
         )
 
-        # reconstructed_images = self.image_tokenizer.diffusion_model(
-        #     image_embeds=image_embeds,
-        #     negative_image_embeds=None,
-        #     guidance_scale=10,
-        #     noise_level=0,
-        #     num_inference_steps=50,
-        #     latents=self.image_tokenizer.latents,
-        # ).images
+        reconstructed_images = self.image_tokenizer.diffusion_model(
+            image_embeds=image_embeds,
+            negative_image_embeds=None,
+            guidance_scale=10,
+            noise_level=0,
+            latents=self.image_tokenizer.latents,
+        ).images
+        # save image
+        save_path = f"{self.cfg.result_path}/{self.global_step}"
+        os.makedirs(save_path, exist_ok=True)
+
+        for i, img in enumerate(reconstructed_images):
+            img.save(f"{save_path}/{image_id[i]}")
+
+
         #
         # tensor_images = []
         # for img in reconstructed_images:
@@ -912,8 +946,23 @@ class SEEDTrainingWrapper(LightningModule):
         # )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=3e-5, betas=(0.9, 0.999), weight_decay=1e-8)
-        scheduler = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=100, num_training_steps=5000)
+        if self.trainer.max_steps != -1:
+            num_training_steps = self.trainer.max_steps
+        else:
+            limit_batches = self.trainer.limit_train_batches
+
+            dataset = self.trainer._data_connector._train_dataloader_source.dataloader()
+            batches = len(dataset)
+
+            batches = min(batches, limit_batches) if isinstance(limit_batches, int) else int(limit_batches * batches)
+
+            num_devices = max(1, self.trainer.num_devices)
+            effective_accum = self.trainer.accumulate_grad_batches * num_devices
+            num_training_steps = (batches // effective_accum) * self.trainer.max_epochs
+
+        print(f"#### num_training_steps: {num_training_steps}")
+        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-5, betas=(0.9, 0.999), weight_decay=1e-4)
+        scheduler = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=50, num_training_steps=num_training_steps)
 
         lr_scheduler_config = {
             "scheduler": scheduler,
@@ -959,6 +1008,17 @@ class SEEDTrainingWrapper(LightningModule):
                 global_step=self.global_step,
             )
 
+    def on_validation_epoch_end(self):
+        original_image_dir = '/ssd0/data/coco/images/val2014'
+        generated_image_dir = f"{self.cfg.result_path}/{self.global_step}"
+        clip_score = calculate_clip_s_for_folder(original_image_dir, generated_image_dir)
+
+        print(f"clip score: {clip_score}")
+        self.log_dict({
+            'clip_score': clip_score,
+        }, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+
 if __name__ == "__main__":
     # os.environ["CUDA_VISIBLE_DEVICES"] = '4'
     cfg, cfg_yaml = build_config()
@@ -972,7 +1032,7 @@ if __name__ == "__main__":
 
     os.makedirs(cfg.result_file_path, exist_ok=True)
 
-    datamodule = build_datamodule(
+    datamodule = DataModule(
         cfg=cfg,
         train_transform=transform,
         val_transform=transform,
@@ -980,13 +1040,6 @@ if __name__ == "__main__":
         epoch=cfg.experiment.max_epochs,
         total_gpus=cfg.dist.n_gpus,
     )
-
-    datamodule.setup()
-    train_dataloader = datamodule.train_dataloader()
-    val_dataloader = datamodule.val_dataloader()
-
-    print(f"### Number of train: {len(train_dataloader)}")
-    print(f"### Number of valid: {len(val_dataloader)}")
 
     tb_logger = pl_loggers.TensorBoardLogger(save_dir=cfg.result_file_path)
     lr_logger = pl.callbacks.LearningRateMonitor(logging_interval="step")
@@ -1003,23 +1056,20 @@ if __name__ == "__main__":
         # ),
         strategy="ddp",
         max_epochs=cfg.experiment.max_epochs,
-        deterministic=True,
+        deterministic=False,
         logger=tb_logger,
         log_every_n_steps=1,
-        # val_check_interval=cfg.experiment.val_check_interval,
-        check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
+        val_check_interval=cfg.experiment.val_check_interval,
+        # check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
         enable_checkpointing=True,
         # Debug
-        num_sanity_val_steps=2,
+        num_sanity_val_steps=0,
         # overfit_batches=cfg.experiment.overfit_batches,
         callbacks=[ModelSummary(max_depth=3), lr_logger],
         accumulate_grad_batches=cfg.experiment.grad_accumulation
     )
 
     wrapper = SEEDTrainingWrapper(cfg).to(device)
-    wrapper.setup("fit")
 
-    trainer.fit(
-        wrapper, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader,
-    )
+    trainer.fit(model=wrapper, datamodule=datamodule)
     trainer.strategy.barrier()

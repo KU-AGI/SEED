@@ -555,7 +555,7 @@ class SEEDTrainingWrapper(LightningModule):
     def configure_optimizers(self):
         # optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, betas=(0.9, 0.999), weight_decay=1e-8)
         lr = self.cfg.optimizer.max_lr
-        betas = (self.cfg.hyperparameters.beta1, self.cfg.hyperparameters.beta2)
+        betas = (self.cfg.hyperparameters.beta_1, self.cfg.hyperparameters.beta_2)
         weight_decay = self.cfg.hyperparameters.weight_decay
         optimizer = torch.optim.AdamW(self.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
 
@@ -580,8 +580,14 @@ class SEEDTrainingWrapper(LightningModule):
                 "lr_scheduler": lr_scheduler_config,}
         
     def on_validation_epoch_end(self):
-        original_image_dir = '/ssd0/data/coco/images/val2014'
-        generated_image_dir = f"{self.cfg.result_path}/{self.current_epoch}"
+        if self.logger is not None and isinstance(self.logger, pl_loggers.TensorBoardLogger):
+            tb_log_dir = self.logger.log_dir
+        else:
+            tb_log_dir = self.cfg.result_path
+
+        original_image_dir = self.cfg.root_dir
+        generated_image_dir = f"{tb_log_dir}/images/version_{self.logger.version}/epoch_{self.current_epoch}/images"
+        # generated_image_dir = f"{self.cfg.result_path}/{self.current_epoch}"
         clip_score = calculate_clip_s_for_folder(original_image_dir, generated_image_dir)
         
         print(f"clip score: {clip_score}")
@@ -641,7 +647,7 @@ if __name__ == "__main__":
         cfg=cfg,
         train_transform=transform,
         val_transform=transform,
-        pin_memory=False,
+        pin_memory=True,
         epoch=cfg.experiment.max_epochs,
         total_gpus=cfg.dist.n_gpus,
     )
@@ -667,7 +673,7 @@ if __name__ == "__main__":
         devices=cfg.dist.n_gpus,
         strategy="ddp",
         max_epochs=cfg.experiment.max_epochs,
-        deterministic=True,
+        deterministic=cfg.experiment.deterministic,
         logger=tb_logger,
         log_every_n_steps=cfg.experiment.log_every_n_steps,
         # val_check_interval=cfg.experiment.val_check_interval,
@@ -679,17 +685,17 @@ if __name__ == "__main__":
         accumulate_grad_batches=cfg.experiment.grad_accumulation,
         gradient_clip_val=cfg.optimizer.grad_clip_val,
     )
-
-    wrapper = SEEDTrainingWrapper(cfg).to(device)
-    wrapper.setup("fit")
     
-    # wrapper = SEEDTrainingWrapper(cfg).to(device)
+    wrapper = SEEDTrainingWrapper(cfg).to(device)
+
     # checkpoint_path = '/ssd0/checkpoints/seed_training_logs_zheedong/stage1_aica/epoch=39-step=11120.ckpt'
     # wrapper = SEEDTrainingWrapper.load_from_checkpoint(checkpoint_path, cfg=cfg, strict=False).to(device)
-    # wrapper.setup("fit")
+
+    wrapper.setup("fit")
     
 
     trainer.fit(
         wrapper, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader,
+        ckpt_path="/home/zheedong/Projects/SEED/logs/seed_stage2_with_codebook/lightning_logs/version_0/checkpoints/epoch=15-step=3136.ckpt"
     )
     trainer.strategy.barrier()

@@ -1,0 +1,4 @@
+root_dir: /ssd0/data/coco/images/val2014
+karpathy_file: /ssd0/data/coco/annotations/karpathy/dataset_coco_train.json
+
+MAX_WORDS: 160

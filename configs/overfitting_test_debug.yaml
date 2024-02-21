@@ -2,7 +2,7 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/diffusion_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_path: none
+result_path: ./logs
 result_file_path: ./logs/sds_test
 #result_file_path: ./logs/overfitting_test_debug
 checkpoint_path:
@@ -13,7 +13,7 @@ resume: False
 finetune: False
 
 dist:
-  n_gpus: 1
+  n_gpus: 2
   n_nodes: 1
 
 dataset:

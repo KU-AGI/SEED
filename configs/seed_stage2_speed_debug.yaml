@@ -1,0 +1,70 @@
+cfg_path: ???
+tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
+transform_cfg_path: configs/transform/clip_transform.yaml
+model_cfg_path: configs/llm/seed_llama_8b.yaml 
+result_path: ???
+result_file_path: ./logs/seed_stage2_speed_debug
+checkpoint_path:
+  model_path: pretrained/seed_tokenizer/seed_quantizer.pt
+  diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
+karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
+root_dir: /ssd0/data/coco/images/val2014
+eval: False
+resume: False
+finetune: False
+
+dist:
+  n_gpus: 2
+  n_nodes: 1
+
+dataset:
+  type: webdataset
+  name: debug
+  loc: bcloud
+  num_workers: 16
+  shuffle: True
+  tokenizer:
+    type: ClipBPE
+    hparams:
+      context_length: 256
+      bpe_pdrop: 0.1
+  transform:
+    type: dalle-vqvae
+    hparams:
+      resolution: 224
+  gt_text: True
+
+stage1:
+  ema_update: False
+  init: 'BLIP2'
+  # init: 'SEED'
+
+experiment:
+  seed: 0
+  stage: 2
+  local_batch_size: 2000
+  val_batch_size: 256 
+  test_split: train
+  max_epochs: 1
+  grad_accumulation: 1
+  # overfit_batches: 1
+  # val_check_interval: 100
+  check_val_every_n_epoch: 1
+  enable_checkpointing: False
+  log_every_n_steps: 1
+  num_sanity_val_steps: 0
+  # num_warmup_steps: 2000
+  num_warmup_steps: 500
+
+optimizer:
+  vit_precision: 'fp16'
+  diffusion_precision: 'fp16'
+  precision: 'bf16'
+  max_lr: 5e-6
+  # grad clip value zero is equivalent to no clipping
+  grad_clip_val: 1.0
+
+hyperparameters:
+  beta_1: 0.9
+  beta_2: 0.999
+  weight_decay: 5e-2

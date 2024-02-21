@@ -1,0 +1,55 @@
+cfg_path: ???
+tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
+transform_cfg_path: configs/transform/clip_transform.yaml
+model_cfg_path: configs/llm/seed_llama_8b.yaml 
+result_path: /ssd0/checkpoints/seed_tokenizer/stage2_with_recon
+result_file_path: ./logs/seed_stage2_proj
+checkpoint_path:
+  model_path: pretrained/seed_tokenizer/seed_quantizer.pt
+  diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
+eval: False
+resume: False
+finetune: False
+
+dist:
+  n_gpus: 4
+  n_nodes: 1
+
+dataset:
+  type: webdataset
+  name: cc3m_coco_laion_coco3
+  loc: bcloud
+  num_workers: 8
+  shuffle: True
+  tokenizer:
+    type: ClipBPE
+    hparams:
+      context_length: 64
+      bpe_pdrop: 0.1
+  transform:
+    type: dalle-vqvae
+    hparams:
+      resolution: 256
+  gt_text: True
+
+stage1:
+  ema_update: False
+
+stage2:
+  image_caption_ratio: 0.5
+
+experiment:
+  seed: 0
+  local_batch_size: 1024
+  
+  val_batch_size: 1
+  test_split: train
+  max_epochs: 60
+  grad_accumulation: 1
+  val_check_interval: 1
+  check_val_every_n_epoch: 1
+  enable_checkpointing: True
+
+optimizer:
+  fp16: True
+  grad_clip_val: 0.5

@@ -229,8 +229,8 @@ class SEEDDataModule(pl.LightningDataModule):
             root_dir=self.cfg.dataset.val_config.root_dir,
             karpathy_file=self.cfg.dataset.val_config.karpathy_file_path,
             tokenizer=None,
-            start_index=self.cfg.dataset.val_config.start_index,
-            end_index=self.cfg.dataset.val_config.end_index,
+            start_index=self.cfg.dataset.val_config.start_index if self.cfg.dataset.val_config.start_index != "None" else None,
+            end_index=self.cfg.dataset.val_config.end_index if self.cfg.dataset.val_config.end_index != "None" else None,
         )
     
 

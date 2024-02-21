@@ -1,0 +1,72 @@
+cfg_path: ???
+tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
+transform_cfg_path: configs/transform/clip_transform.yaml
+model_cfg_path: configs/llm/seed_llama_8b.yaml 
+result_file_path: ./logs/sds_coco
+checkpoint_path:
+  model_path: pretrained/seed_tokenizer/seed_quantizer.pt
+  diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
+
+resume: False
+load_weight: False
+weight_path: None
+eval: False
+
+dist:
+  n_gpus: 1
+  n_nodes: 1
+
+dataset:
+  train_config:
+    dataset_configs: ['configs/data/cc15m.yaml']
+    weights: [1]
+    shardshuffle: 100
+    resampled: True
+    world_size: 1
+    one_epoch_data_size: 3000000
+  val_config:
+    karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
+    root_dir: /ssd0/data/coco/images/val2014
+    start_index: 0
+    end_index: 256
+  num_workers: 16
+  shuffle: True
+
+stage1:
+  init: 'BLIP-2'
+
+stage2:
+  bypass_codebook: True
+  load_diffusion: True
+  train_unet: False
+  use_clip_loss: True
+
+experiment:
+  seed: 0
+  stage: 2
+  local_batch_size: 32
+  val_batch_size: 4
+  test_split: train
+  max_epochs: 5
+  deterministic: False
+  grad_accumulation: 8
+  check_val_every_n_epoch: 1
+  enable_checkpointing: True
+  log_every_n_steps: 1
+  num_sanity_val_steps: 1
+  num_warmup_steps: 50
+  grad_clip_val: 1
+  val_check_interval: 200
+
+
+optimizer:
+  vit_precision: 'fp16'
+  diffusion_precision: 'fp16'
+  precision: 'bf16'
+  max_lr: 1e-4
+
+hyperparameters:
+  beta_1: 0.9
+  beta_2: 0.999
+  weight_decay: 1e-8
+

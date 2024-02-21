@@ -959,7 +959,7 @@ class SEEDTrainingWrapper(LightningModule):
                 )
     
     def on_validation_epoch_start(self):
-        os.makedirs(f"{self.cfg.result_file_path}/{self.current_epoch}", exist_ok=True)
+        return
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx: int, save_path=None):
@@ -980,9 +980,8 @@ class SEEDTrainingWrapper(LightningModule):
             image, captions, image_id = batch
             bypass_codebook = self.cfg.stage2.bypass_codebook
 
-            image_embeds = self.forward_stage_2(batch, batch_idx, bypass_codebook)
-            
             with torch.no_grad():
+                image_embeds = self.forward_stage_2(batch, batch_idx, bypass_codebook)
                 reconstructed_images = self.image_tokenizer.diffusion_model(
                     image_embeds=image_embeds,
                     negative_image_embeds=None,
@@ -1104,6 +1103,11 @@ if __name__ == "__main__":
 
     tb_logger = pl_loggers.TensorBoardLogger(save_dir=cfg.result_file_path)
     lr_logger = pl.callbacks.LearningRateMonitor(logging_interval="step")
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        save_top_k=3,
+        monitor="clip_score_coco_karpathy" if cfg.experiment.stage == 2 else "val/loss",
+        mode="max",
+    )
 
     trainer = pl.Trainer(
         accelerator=device,
@@ -1119,7 +1123,7 @@ if __name__ == "__main__":
         enable_checkpointing=cfg.experiment.enable_checkpointing,
         num_sanity_val_steps=cfg.experiment.num_sanity_val_steps,
         precision=str(cfg.optimizer.precision),
-        callbacks=[ModelSummary(max_depth=3), lr_logger],
+        callbacks=[ModelSummary(max_depth=3), lr_logger] + [checkpoint_callback] if cfg.experiment.enable_checkpointing else [],
         accumulate_grad_batches=cfg.experiment.grad_accumulation,
         gradient_clip_val=cfg.optimizer.grad_clip_val,
     )
@@ -1130,7 +1134,7 @@ if __name__ == "__main__":
     wrapper = SEEDTrainingWrapper(cfg).to(device)
 
     if cfg.load_weight:
-        wrapper.load_from_checkpoint(cfg.weight_path)
+        wrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg)
         print("Loaded model from checkpoint")
     else:
         if cfg.experiment.stage == 1:

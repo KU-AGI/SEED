@@ -63,7 +63,7 @@ optimizer:
   precision: 'bf16'
   max_lr: 5e-5
   # grad clip value zero is equivalent to no clipping
-  grad_clip_val: 0
+  grad_clip_val: 1.0
 
 hyperparameters:
   beta_1: 0.9

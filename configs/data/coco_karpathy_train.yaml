@@ -1,0 +1,4 @@
+META:
+  - ["/ssd0/data/coco_karpathy/train/{00000..00056}.tar", 550000]
+    
+MAX_WORDS: 128

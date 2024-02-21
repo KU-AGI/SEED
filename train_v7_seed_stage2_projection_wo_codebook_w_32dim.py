@@ -42,6 +42,7 @@ from functools import partial
 from models.seed_qformer.vit import Block
 from pytorch_lightning.callbacks import ModelSummary
 from pytorch_lightning.utilities import grad_norm
+from pytorch_lightning.profiler import AdvancedProfiler
 
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -64,6 +65,9 @@ NUM_IMG_TOKNES = 32
 NUM_IMG_CODES = 8192
 IMAGE_ID_SHIFT = 32000
 
+time_list = [] ## use for debug
+
+
 class SEEDTrainingWrapper(LightningModule):
     """Training wrapper for SEED
 
@@ -83,6 +87,7 @@ class SEEDTrainingWrapper(LightningModule):
                             )
 
         self.B = None
+        self.pre_batch = None
         
         # My code
         # For make clip embedding directly from [b, 32, 32] to [b, 1024]
@@ -482,7 +487,8 @@ class SEEDTrainingWrapper(LightningModule):
         #------------------------
         # Stage 2 Training
         #------------------------
-        img = self.transform_224(batch.img)
+        # img = self.transform_224(batch.img)
+        img = self.transform_224(batch)
 
         #------------------------
         # Stage 2 - 1 : Codebook Training
@@ -498,7 +504,7 @@ class SEEDTrainingWrapper(LightningModule):
         # quant [b, 32, 32], loss_embed [b, 32, 768], embed_ind [b, 32]
         # quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
         
-        # bypass code book
+        # bypass code book 
         quant = query_output_down
         
 
@@ -615,7 +621,7 @@ class SEEDTrainingWrapper(LightningModule):
         # )
     
     def training_step(self, batch, batch_idx: int):
-        self.B = batch.img.shape[0]
+        #self.B = batch.img.shape[0]
         
         # gt_text is a list of string
         # Encoding text in list to ascii
@@ -624,7 +630,7 @@ class SEEDTrainingWrapper(LightningModule):
         #stage_1_loss = self.get_stage_1_loss(batch, batch_idx)
         
         stage_2_loss = self.get_stage_2_loss(batch, batch_idx)
-        
+
         # mock loss 1
         #stage_2_loss = torch.tensor(0.1979, requires_grad=True)
 
@@ -732,6 +738,7 @@ if __name__ == "__main__":
 
     tb_logger = pl_loggers.TensorBoardLogger(save_dir=cfg.result_file_path)
     lr_logger = pl.callbacks.LearningRateMonitor(logging_interval="step")
+    #profiler = AdvancedProfiler(output_filename="profiler.txt")
 
     trainer = pl.Trainer(
         accelerator=device,
@@ -745,7 +752,7 @@ if __name__ == "__main__":
         ),
         #strategy="ddp",
         max_epochs=cfg.experiment.max_epochs,
-        deterministic=True,
+        deterministic=False,
         logger=tb_logger,
         log_every_n_steps=1,
         # val_check_interval=cfg.experiment.val_check_interval,
@@ -757,19 +764,43 @@ if __name__ == "__main__":
         precision='bf16',
         # overfit_batches=cfg.experiment.overfit_batches,
         callbacks=[ModelSummary(max_depth=3), lr_logger],
-        accumulate_grad_batches=cfg.experiment.grad_accumulation
+        accumulate_grad_batches=cfg.experiment.grad_accumulation,
+        #profiler=profiler,
     )
 
     # wrapper = SEEDTrainingWrapper(cfg).to(device)
     # wrapper.setup("fit")
     
-    wrapper = SEEDTrainingWrapper(cfg).to(device)
+    # wrapper = SEEDTrainingWrapper(cfg).to(device)
     checkpoint_path = '/ssd0/checkpoints/seed_training_logs_zheedong/stage1_aica/epoch=39-step=11120.ckpt'
     wrapper = SEEDTrainingWrapper.load_from_checkpoint(checkpoint_path, cfg=cfg, strict=False).to(device)
     wrapper.setup("fit")
     
 
+    ## for dataloader speed test
+    from read_image_only_dataloader import CombinedDataset, FinetuneData
+    from torch.utils.data import DataLoader
+    dataset_configs = ['configs/data/cc15m.yaml', 'configs/data/laion-coco.yaml', 'configs/data/mscoco.yaml']
+
+    datasets = []
+    for config in dataset_configs:
+        dataset = FinetuneData(config, 
+                                shardshuffle=100,
+                                resampled=True,
+                                world_size=1,)
+        datasets.append(dataset)
+
+    
+    combined_dataset = CombinedDataset(datasets_configs=dataset_configs, 
+                                       datasets=datasets,
+                                       rank=0, 
+                                       world_size=1,
+                                       length=1000000/4,
+                                       weights=[1, 8, 1])
+        
+    dataloader = DataLoader(combined_dataset, batch_size=1024, num_workers=4)
     trainer.fit(
-        wrapper, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader,
+        #wrapper, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader,
+        wrapper, train_dataloaders=dataloader#, val_dataloaders=val_dataloader,
     )
     trainer.strategy.barrier()

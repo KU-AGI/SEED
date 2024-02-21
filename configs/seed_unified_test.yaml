@@ -13,7 +13,7 @@ weight_path: None
 eval: False
 
 dist:
-  n_gpus: 1
+  n_gpus: 2
   n_nodes: 1
 
 dataset:
@@ -28,12 +28,13 @@ dataset:
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
     root_dir: /ssd0/data/coco/images/val2014
     start_index: 0
-    end_index: 256
+    end_index: None
   num_workers: 16
   shuffle: True
+  text_max_length: 128
 
 stage1:
-  init: 'BLIP-2'
+  init: 'SEED'
 
 stage2:
   bypass_codebook: False
@@ -41,9 +42,9 @@ stage2:
 
 experiment:
   seed: 0
-  stage: 1
-  local_batch_size: 512
-  val_batch_size: 4
+  stage: 2
+  local_batch_size: 1024
+  val_batch_size: 16
   test_split: train
   max_epochs: 40
   deterministic: False
@@ -59,7 +60,7 @@ optimizer:
   vit_precision: 'fp16'
   diffusion_precision: 'fp16'
   precision: 'bf16'
-  max_lr: 1e-3
+  max_lr: 7e-4
 
 hyperparameters:
   beta_1: 0.9

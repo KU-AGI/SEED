@@ -1,0 +1,3 @@
+META:
+  - ["/ssd0/data/mscoco/{00000..00059}.tar", 600000]
+  #- ["/ssd0/data/mscoco/{00000..00001}.tar", 10000]

@@ -1,0 +1,5 @@
+META:
+  - ["/ssd0/data/cc12m_filtered/{00000..01242}_filtered.tar", 12000000]
+  - ["/ssd0/data/cc3m_filtered_v3/{00000..00331}_filtered.tar", 3000000]
+    
+MAX_WORDS: 160

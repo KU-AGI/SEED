@@ -2,7 +2,7 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/diffusion_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_path: none
+result_path: ./logs
 result_file_path: ./logs/sds_coco
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
@@ -17,7 +17,7 @@ dist:
 
 dataset:
   type: webdataset
-  name: cc3m_coco
+  name: cc15m
   loc: bcloud
   num_workers: 32 
   shuffle: True
@@ -41,12 +41,12 @@ stage2:
 experiment:
   seed: 0
   local_batch_size: 32
-  val_batch_size: 64
+  val_batch_size: 4
   max_epochs: 5
   grad_accumulation: 4
 #  overfit_batches: 1
-#  val_check_interval: 0.01
-  check_val_every_n_epoch: 1
+  val_check_interval: 200
+#  check_val_every_n_epoch: 1
   enable_checkpointing: False
 
 optimizer:
