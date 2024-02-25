@@ -22,7 +22,7 @@ def to_attr_dict(cfg):
     return cfg
 
 def build_config(struct=False):
-    cfg = OmegaConf.load('configs/overfitting_test.yaml')
+    cfg = OmegaConf.load('configs/seed_unified_test.yaml')
     OmegaConf.set_struct(cfg, struct)
     cfg = override_from_file_name(cfg)
     cfg = override_from_cli(cfg)

@@ -1,7 +1,7 @@
 import pytorch_lightning as pl
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.dataset import ConcatDataset
+from torch.utils.data.dataset import ConcatDataset, random_split
 from torch.utils.data import Sampler, DistributedSampler
 from io import BytesIO
 from PIL import Image
@@ -10,7 +10,6 @@ import random
 import os
 import json
 import tarfile
-
 
 class CompressionDataset(Dataset):
     def __init__(self, compression_level, transform=None):
@@ -136,18 +135,38 @@ class DistributedCompressionLevelSampler(Sampler):
         return self.num_samples // self.batch_size
 
 class CompressionDataModule(LightningDataModule):
-    def __init__(self, batch_size=32, num_workers=4, transform=None, compression_level=0):
+    def __init__(self, cfg=None, transform=None, compression_level=0):
         super().__init__()
-        self.batch_size = batch_size
-        self.num_workers = num_workers
+        self.cfg = cfg
+        self.local_batch_size = cfg.experiment.local_batch_size
+        self.val_batch_size = cfg.experiment.val_batch_size
+        self.num_workers = cfg.dataset.num_workers
         self.transform = transform
         self.compression_level = compression_level
 
     def setup(self):
         self.datasets = []
         self.datasets = CompressionDataset(compression_level=self.compression_level, transform=self.transform)
+        self.train_size = int(0.98 * len(self.datasets))
+        self.var_size = len(self.datasets) - self.train_size
+        self.train_dataset, self.val_dataset = random_split(self.datasets, [self.train_size, self.var_size])
 
     def train_dataloader(self):
-        return DataLoader(self.datasets,
-                          batch_size=self.batch_size,
-                          num_workers=self.num_workers,)
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.local_batch_size,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            # drop_last=True,
+            # shuffle=False,
+        )
+    
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.val_batch_size,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            # drop_last=True,
+            # shuffle=False,
+        )

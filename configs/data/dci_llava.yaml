@@ -1,0 +1,4 @@
+META:
+  - ["/ssd0/data/DCI_LLaVA_wds/{00000..00001}.tar", 20000]
+
+CONTAIN_TEXT: True

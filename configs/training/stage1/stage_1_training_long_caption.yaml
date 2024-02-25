@@ -2,14 +2,13 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/long_caption_finetuning
+result_file_path: ./logs/capsfusion_dci_llava_long_caption_last_token
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
 
 resume: False
 load_weight: False
-# weight_path: /home/zheedong/Projects/SEED/logs/long_caption_debug/stage1_v1/epoch=39-step=11120.ckpt
 weight_path: None
 eval: False
 
@@ -19,20 +18,22 @@ dist:
 
 dataset:
   train_config:
-    dataset_configs: ['configs/data/mscoco.yaml']
-    weights: [10]
+    dataset_configs: ['configs/data/laion_capsfusion.yaml', 'configs/data/dci_llava.yaml', 'configs/data/coco_karpathy_train.yaml']
+    weights: [1000, 1, 1]
     shardshuffle: 100
     resampled: True
     world_size: 1
     one_epoch_data_size: 1000000
   val_config:
-    karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
-    root_dir: /ssd0/data/coco/images/val2014
-    start_index: 0
-    end_index: None
-  num_workers: 8
+    use_coco_val: False
+    dataset_configs: ['configs/data/laion_capsfusion_val.yaml']
+    weights: [1]
+    shardshuffle: 100
+    resampled: True
+    world_size: 1
+    one_epoch_data_size: 1000
+  num_workers: 16
   shuffle: True
-  # Token level length
   text_max_length: 512
 
 stage1:
@@ -51,10 +52,11 @@ experiment:
   max_epochs: 40
   deterministic: False
   grad_accumulation: 1
-  check_val_every_n_epoch: 1
+  val_check_interval: 0.2
+  # check_val_every_n_epoch: 1
   enable_checkpointing: True
   log_every_n_steps: 1
-  num_sanity_val_steps: 0
+  num_sanity_val_steps: 1
   num_warmup_steps: 200
   grad_clip_val: 0.5
 
@@ -62,7 +64,7 @@ optimizer:
   vit_precision: 'fp16'
   diffusion_precision: 'fp16'
   precision: 'bf16'
-  max_lr: 5e-6
+  max_lr: 7e-7
 
 hyperparameters:
   beta_1: 0.9

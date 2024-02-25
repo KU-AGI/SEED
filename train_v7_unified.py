@@ -421,7 +421,7 @@ class SEEDTrainingWrapper(LightningModule):
             text,
             padding="max_length",
             truncation=True,
-            max_length=128,
+            max_length=self.cfg.dataset.text_max_length,
             return_tensors="pt",
         )
 
@@ -532,7 +532,7 @@ class SEEDTrainingWrapper(LightningModule):
             text,
             padding="max_length",
             truncation=True,
-            max_length=128,
+            max_length=self.cfg.dataset.text_max_length,
             return_tensors="pt",
         )
 
@@ -963,6 +963,8 @@ class SEEDTrainingWrapper(LightningModule):
             tb_log_dir = self.cfg.result_file_path  # Fallback directory if logger is not set
 
         if self.stage == 1:
+            if batch_idx > 4:
+                return
             save_path = f"{tb_log_dir}/histogram"
             os.makedirs(save_path, exist_ok=True)
 
@@ -1088,7 +1090,7 @@ if __name__ == "__main__":
 
     os.makedirs(cfg.result_file_path, exist_ok=True)
 
-    datamodule = SEEDDataModule(cfg, transform=transform)
+    datamodule = SEEDDataModule(cfg, transform=transform, use_coco_val=cfg.dataset.val_config.use_coco_val)
     datamodule.setup()
     train_dataloader = datamodule.train_dataloader()
     val_dataloader = datamodule.val_dataloader()
@@ -1097,10 +1099,15 @@ if __name__ == "__main__":
 
     tb_logger = pl_loggers.TensorBoardLogger(save_dir=cfg.result_file_path)
     lr_logger = pl.callbacks.LearningRateMonitor(logging_interval="step")
+    # checkpoint_callback = pl.callbacks.ModelCheckpoint(
+    #     save_top_k=3,
+    #     monitor="clip_score_coco_karpathy" if cfg.experiment.stage == 2 else "val/loss_itc_mean",
+    #     mode="max" if cfg.experiment.stage == 2 else "min",
+    #     save_last=True,
+    # )
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        save_top_k=3,
-        monitor="clip_score_coco_karpathy" if cfg.experiment.stage == 2 else "val/loss",
-        mode="max",
+        save_last=True,
+        every_n_train_steps=300,
     )
 
     trainer = pl.Trainer(
@@ -1112,14 +1119,15 @@ if __name__ == "__main__":
         deterministic=cfg.experiment.deterministic,
         logger=tb_logger,
         log_every_n_steps=cfg.experiment.log_every_n_steps,
-        # val_check_interval=cfg.experiment.val_check_interval,
-        check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
+        val_check_interval=cfg.experiment.val_check_interval,
+        # check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
         enable_checkpointing=cfg.experiment.enable_checkpointing,
         num_sanity_val_steps=cfg.experiment.num_sanity_val_steps,
         precision=str(cfg.optimizer.precision),
         callbacks=[ModelSummary(max_depth=3), lr_logger] + [checkpoint_callback] if cfg.experiment.enable_checkpointing else [],
+        # callbacks=[ModelSummary(max_depth=3), lr_logger],
         accumulate_grad_batches=cfg.experiment.grad_accumulation,
-        gradient_clip_val=cfg.optimizer.grad_clip_val,
+        gradient_clip_val=cfg.experiment.grad_clip_val,
     )
 
     if cfg.load_weight and cfg.resume:
@@ -1128,11 +1136,11 @@ if __name__ == "__main__":
     wrapper = SEEDTrainingWrapper(cfg).to(device)
 
     if cfg.load_weight:
-        wrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg)
+        wrapper = wrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg)
         print("Loaded model from checkpoint")
     else:
         if cfg.experiment.stage == 1:
-            print("Stage 1 init from BLIP-2")
+            print(f"Stage 1 init from {cfg.stage1.init}")
         elif cfg.experiment.stage == 2:
             print("Stage 2 init from Scratch")
 

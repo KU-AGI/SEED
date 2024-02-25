@@ -1,0 +1,5 @@
+META:
+  - ["/ssd0/data/laion_capsfusion_wds/{00001..01380}_000000.tar", 11152883]
+  # - ["/ssd0/data/laion_capsfusion_wds/{00000..00001}_000000.tar", 20000]
+
+CONTAIN_TEXT: False
