@@ -152,8 +152,6 @@ class SEEDTrainingWrapper(LightningModule):
                 # Update the model with the weights
                 filtered_state_dict = {k: v for k, v in blip_model.state_dict().items() if k in self.image_tokenizer.model.state_dict()}
                 self.image_tokenizer.model.load_state_dict(filtered_state_dict, strict=False)
-            elif self.cfg.stage1.init == "SEED":
-                print("Load init weights from SEED")
 
             print("Set stage 2 model not trainable")
             for param in self.image_tokenizer.model.quantize.parameters():
@@ -296,14 +294,8 @@ class SEEDTrainingWrapper(LightningModule):
             quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
             embed_ind = embed_ind.reshape(quant.shape[0], -1)
 
-
-        # # [b, 32, 32] => [b, 32, 768]
+        # [b, 32, 32] => [b, 32, 768]
         query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
-
-        quant_embedding = self.image_tokenizer.model.quantize.get_codebook_entry(embed_ind)
-
-        # # [b, 32, 32] => [b, 32, 768]
-        query_output_up = self.image_tokenizer.model.decode_task_layer(quant_embedding)
 
         # [b, 32, 768] => [b, 32, 768]
         query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
@@ -321,7 +313,6 @@ class SEEDTrainingWrapper(LightningModule):
             on_epoch=True,
             prog_bar=True,
             logger=True,
-            batch_size=self.B,
         )
 
         if "loss_embed" in loss_dict.keys():
@@ -486,7 +477,7 @@ class SEEDTrainingWrapper(LightningModule):
         rank = dist.get_rank()
         bs = image.size(0)
         targets = torch.linspace(rank * bs, rank * bs + bs - 1, bs, dtype=int).to(
-            self.device
+            image.device
         )
 
         loss_itc = (
@@ -501,7 +492,6 @@ class SEEDTrainingWrapper(LightningModule):
                 on_epoch=True,
                 prog_bar=True,
                 logger=True,
-                batch_size=self.B,
             )
 
         return loss_itc
@@ -713,8 +703,6 @@ class SEEDTrainingWrapper(LightningModule):
                         on_epoch=True,
                         prog_bar=True,
                         logger=True,
-                        sync_dist=True,
-                        batch_size=image.size(0),
                     )
 
             loss_mean /= 32
@@ -725,8 +713,6 @@ class SEEDTrainingWrapper(LightningModule):
                     on_epoch=True,
                     prog_bar=True,
                     logger=True,
-                    sync_dist=True,
-                    batch_size=image.size(0),
                 )
 
         return
@@ -964,6 +950,9 @@ class SEEDTrainingWrapper(LightningModule):
                     generation_mlp_norm[norm],
                     global_step=self.global_step,
                 )
+    
+    def on_validation_epoch_start(self):
+        return
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx: int, save_path=None):
@@ -984,9 +973,8 @@ class SEEDTrainingWrapper(LightningModule):
             image, captions, image_id = batch
             bypass_codebook = self.cfg.stage2.bypass_codebook
 
-            image_embeds = self.forward_stage_2(batch, batch_idx, bypass_codebook)
-            
             with torch.no_grad():
+                image_embeds = self.forward_stage_2(batch, batch_idx, bypass_codebook)
                 reconstructed_images = self.image_tokenizer.diffusion_model(
                     image_embeds=image_embeds,
                     negative_image_embeds=None,
@@ -1036,9 +1024,6 @@ class SEEDTrainingWrapper(LightningModule):
                     global_step=self.sample_image_ind,
                 )
                 self.sample_image_ind += 1
-    
-    def on_validation_epoch_start(self):
-        return
 
     def on_validation_epoch_end(self):
         if self.logger is not None and isinstance(self.logger, pl_loggers.TensorBoardLogger):
@@ -1102,23 +1087,25 @@ if __name__ == "__main__":
 
     os.makedirs(cfg.result_file_path, exist_ok=True)
 
-    train_datamodule = CompressionDataModule(
-        batch_size=cfg.experiment.local_batch_size,
-        num_workers=cfg.dataset.num_workers,
+    datamodule = CompressionDataModule(
+        cfg=cfg,
         transform=transform,
-        compression_level=31
+        compression_level=0
     )
-    train_datamodule.setup()
-    train_dataloader = train_datamodule.train_dataloader()
+    datamodule.setup()
+    train_dataloader = datamodule.train_dataloader()
+    val_dataloader = datamodule.val_dataloader()
 
-    val_datamodule = SEEDDataModule(cfg, transform=transform)
-    val_datamodule.setup()
-    val_dataloader = val_datamodule.val_dataloader()
-
-    cfg.experiment.total_training_steps = (len(train_dataloader) // cfg.dist.n_gpus) * cfg.experiment.max_epochs
+    cfg.experiment.total_training_steps = len(train_dataloader) * cfg.experiment.max_epochs // cfg.experiment.grad_accumulation
+    print(f"Training steps in one epoch: {len(train_dataloader)}")
+    print(f"Total training steps: {cfg.experiment.total_training_steps}")
 
     tb_logger = pl_loggers.TensorBoardLogger(save_dir=cfg.result_file_path)
     lr_logger = pl.callbacks.LearningRateMonitor(logging_interval="step")
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        save_top_k=2,
+        every_n_train_steps=300,
+    )
 
     trainer = pl.Trainer(
         accelerator=device,
@@ -1129,12 +1116,12 @@ if __name__ == "__main__":
         deterministic=cfg.experiment.deterministic,
         logger=tb_logger,
         log_every_n_steps=cfg.experiment.log_every_n_steps,
-        # val_check_interval=cfg.experiment.val_check_interval,
-        check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
+        val_check_interval=cfg.experiment.val_check_interval,
+        # check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
         enable_checkpointing=cfg.experiment.enable_checkpointing,
         num_sanity_val_steps=cfg.experiment.num_sanity_val_steps,
         precision=str(cfg.optimizer.precision),
-        callbacks=[ModelSummary(max_depth=3), lr_logger],
+        callbacks=[ModelSummary(max_depth=3), lr_logger, checkpoint_callback],
         accumulate_grad_batches=cfg.experiment.grad_accumulation,
         gradient_clip_val=cfg.optimizer.grad_clip_val,
     )
@@ -1145,11 +1132,11 @@ if __name__ == "__main__":
     wrapper = SEEDTrainingWrapper(cfg).to(device)
 
     if cfg.load_weight:
-        wrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg)
-        print("Loaded model from checkpoint")
+        wrapper = wrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg)
+        print(f"Loaded model from checkpoint {cfg.weight_path}")
     else:
         if cfg.experiment.stage == 1:
-            print("Stage 1 init from BLIP-2")
+            print(f"Stage 1 init from {cfg.stage1.init}")
         elif cfg.experiment.stage == 2:
             print("Stage 2 init from Scratch")
 

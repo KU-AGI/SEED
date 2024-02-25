@@ -2,7 +2,7 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/sds_coco2
+result_file_path: ./logs/seed_FID_not_bypass_codebook
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
@@ -13,22 +13,13 @@ weight_path: None
 eval: False
 
 dist:
-  n_gpus: 1
+  n_gpus: 4
   n_nodes: 1
 
 dataset:
-  train_config:
-    dataset_configs: ['configs/data/cc15m.yaml', 'configs/data/laion-coco.yaml', 'configs/data/mscoco.yaml']
-    weights: [1, 8, 1]
-    shardshuffle: 100
-    resampled: True
-    world_size: 1
-    one_epoch_data_size: 1000000
   val_config:
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
     root_dir: /ssd0/data/coco/images/val2014
-    start_index: 0
-    end_index: 256
   num_workers: 16
   shuffle: True
   text_max_length: 128
@@ -37,37 +28,30 @@ stage1:
   init: 'SEED'
 
 stage2:
-  bypass_codebook: True
+  bypass_codebook: False
   load_diffusion: True
-  train_unet: True
 
 experiment:
   seed: 0
   stage: 2
-  local_batch_size: 128
-  val_batch_size: 8
+  local_batch_size: 1024
+  val_batch_size: 16
   test_split: train
-  max_epochs: 40
+  max_epochs: 1
   deterministic: False
-  grad_accumulation: 8
-#  check_val_every_n_epoch: 1
-  val_check_interval: 400
+  grad_accumulation: 1
+  check_val_every_n_epoch: 1
   enable_checkpointing: True
   log_every_n_steps: 1
   num_sanity_val_steps: 1
   num_warmup_steps: 200
-  recon_loss_weight: 1.0
-  sds_loss_weight: 0.1
-  clip_loss_weight: 1.0
-  use_sds_loss_schedule: True
-  cross_annealing: False
+  grad_clip_val: 0.5
 
 optimizer:
   vit_precision: 'fp16'
   diffusion_precision: 'fp32'
   precision: 'bf16'
   max_lr: 7e-4
-  grad_clip_val: 0.5
 
 hyperparameters:
   beta_1: 0.9

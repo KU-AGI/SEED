@@ -30,7 +30,7 @@ dataset:
     type: dalle-vqvae
     hparams:
       resolution: 256
-  gt_text: Trueq
+  gt_text: True
 
 stage1:
   ema_update: False

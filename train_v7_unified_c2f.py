@@ -1,5 +1,4 @@
 import os
-from typing import Any, List
 import torch
 from torch.cuda.amp import autocast
 import torch.nn as nn
@@ -14,13 +13,9 @@ import pytorch_lightning as pl
 from pytorch_lightning import LightningModule, seed_everything
 import numpy as np
 from omegaconf import OmegaConf
-from PIL import Image
-from torchvision.transforms.functional import to_pil_image
 import pyrootutils
 
-from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
 import torch.nn.functional as F
-from pytorch_lightning.strategies import DDPStrategy, DDPFullyShardedStrategy
 from einops import rearrange
 import transformers
 
@@ -34,17 +29,15 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import numpy as np
 import matplotlib.pyplot as plt
 
-from models.seed_qformer.vit import Block
 from models.seed_llama_tokenizer import ImageTokenizer
 
-from datamodules.seed_llama_datamodule import SEEDDataModule
+from datamodules.c2f_datamodule import SEEDDataModule
 
 from calculate_clip_score import calculate_clip_s_for_folder
 from utils.config import build_config
 
 from lavis.models import load_model
 from lavis.common.dist_utils import is_dist_avail_and_initialized
-from functools import partial
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
@@ -113,6 +106,14 @@ class SEEDTrainingWrapper(LightningModule):
             self.scheduler = self.image_tokenizer.diffusion_model.scheduler
             self.vae = self.image_tokenizer.diffusion_model.vae
 
+            # For SDS
+            t_range = [0.2, 0.6]
+            # t_range = [0.02, 0.98]
+            self.num_train_timesteps = 1000
+            self.min_step = int(self.num_train_timesteps * t_range[0])
+            self.max_step = int(self.num_train_timesteps * t_range[1])
+            self.alphas = self.image_noising_scheduler.alphas_cumprod  # for convenience
+
         # For logging
         self.pil_to_tensor = transforms.ToTensor()
         self.sample_image_ind = 0
@@ -121,13 +122,20 @@ class SEEDTrainingWrapper(LightningModule):
         self.stage = cfg.experiment.stage
         self.temp = nn.Parameter(0.07 * torch.ones([]))
 
-        # For SDS
-        t_range = [0.2, 0.6]
-        # t_range = [0.02, 0.98]
-        self.num_train_timesteps = 1000
-        self.min_step = int(self.num_train_timesteps * t_range[0])
-        self.max_step = int(self.num_train_timesteps * t_range[1])
-        self.alphas = self.image_noising_scheduler.alphas_cumprod  # for convenience
+        # For C2F
+        self.setup_C2F()
+
+
+    def setup_C2F(self):
+        c2f_schedule = torch.linspace(1, self.cfg.experiment.min_pos_weight, 32)
+        bs = self.cfg.experiment.local_batch_size
+        vbs = self.cfg.experiment.val_batch_size
+        n_pos = self.cfg.experiment.num_positive_samples
+        
+        self.c2f_schedule = c2f_schedule.unsqueeze(0)
+        self.pos_or_neg = torch.eye(bs).unsqueeze(1).repeat(1, n_pos, 1)
+        self.pos_or_neg_valid = torch.eye(vbs).unsqueeze(1).repeat(1, n_pos, 1)
+
 
     def setup(self, stage):
         # Setup training parameter
@@ -224,8 +232,6 @@ class SEEDTrainingWrapper(LightningModule):
             for p in resnet.time_emb_proj.parameters():
                 p.requires_grad = True
 
-
-    
     def random_initialize_stage2_model_weights(self):
         """Random initialize stage 2 model weights
         """        
@@ -407,19 +413,7 @@ class SEEDTrainingWrapper(LightningModule):
         output = torch.cat(tensors_gather, dim=0)
         return output
 
-    def get_stage_1_loss_use_last_token(self, batch, batch_idx: int):
-        """
-            Contrastive loss using last token of the query_output
-        Args:
-            batch (_type_): _description_
-            batch_idx (int): _description_
-            is_validation (bool, optional): _description_. Defaults to False.
-        """
-        if len(batch) == 3:
-            image, text, image_id = batch
-        elif len(batch) == 2:
-            image, text = batch
-
+    def get_qformer_tokens(self, image):
         with torch.no_grad():
             image_embeds = self.image_tokenizer.model.ln_vision(
                 self.image_tokenizer.model.visual_encoder(image)
@@ -437,6 +431,39 @@ class SEEDTrainingWrapper(LightningModule):
             encoder_attention_mask=image_atts,
             return_dict=True,
         )
+
+        return query_output
+
+
+    def get_stage1_loss_c2f(self, batch, batch_idx: int):
+        image, captions, token_ids, abs_diff = batch
+        query_output = self.get_qformer_tokens(image)
+
+        text_tokens = self.image_tokenizer.model.tokenizer(
+            captions,
+            padding="max_length",
+            truncation=True,
+            max_length=300,
+            return_tensors="pt",
+        )
+
+        return None
+
+
+    def get_stage_1_loss_use_last_token(self, batch, batch_idx: int):
+        """
+            Contrastive loss using last token of the query_output
+        Args:
+            batch (_type_): _description_
+            batch_idx (int): _description_
+            is_validation (bool, optional): _description_. Defaults to False.
+        """
+        if len(batch) == 3:
+            image, text, image_id = batch
+        elif len(batch) == 2:
+            image, text = batch
+
+        query_output = self.get_qformer_tokens(image)
 
         # Use last hidden state
         # We have 32 tokens, and use last token as image embedding
@@ -1031,15 +1058,64 @@ class SEEDTrainingWrapper(LightningModule):
         self.save_config()
     
     def training_step(self, batch, batch_idx: int):
-        if len(batch) == 3:
-            image, text, image_id = batch
-        elif len(batch) == 2:
-            image, text = batch
-
-        self.B = image.shape[0]
+        self.B = batch[0].shape[0]
 
         if self.stage == 1:
-            loss = self.get_stage_1_loss_use_last_token(batch, batch_idx)
+            # loss = self.get_stage_1_loss_use_last_token(batch, batch_idx)
+            # loss = self.get_stage1_loss_c2f(batch, batch_idx)
+            image, pos_ids, text_tokens, text_attention_masks = batch
+            query_output = self.get_qformer_tokens(image)
+            image_feats = torch.stack([query_output.last_hidden_state[i].index_select(0, pos_ids[i]) for i in range(self.B)])
+            image_feats = F.normalize(image_feats, dim=-1)
+
+            batch_size, num_positive_samples, token_lens = text_tokens.shape
+
+            text_output = self.image_tokenizer.model.Qformer.bert(
+                text_tokens.reshape(batch_size * num_positive_samples, -1),
+                attention_mask=text_attention_masks.reshape(batch_size * num_positive_samples, -1),
+                return_dict=True,
+            )
+
+            # CLS token
+            # [batch_size * num_positive_samples, embed_dim]
+            text_feats = F.normalize(text_output.last_hidden_state[:, 0, :], dim=-1)
+            text_feats = rearrange(text_feats, "bs*n d -> bs n d", bs=self.B)
+            text_feats = text_feats.reshape(batch_size, num_positive_samples, -1).contiguous()
+
+            ###============== Image-text Contrastive ===================###
+            # [batch_size*num_gpu, num_positive_samples, embed_dim]
+            image_feats_all = self.all_gather_with_grad(image_feats)
+
+            # [batch_size*num_gpu, num_positive_samples, embed_dim]
+            text_feats_all = self.all_gather_with_grad(text_feats)
+
+            mat_image = rearrange(image_feats, "bs n d -> bs 1 1 n d")
+            mat_text_all = rearrange(text_feats_all, "(bs ngpus) n d -> (bs ngpus) n d 1", bs=self.B)
+            sim_i2t = torch.matmul(mat_image, mat_text_all).squeeze(-1)
+
+            mat_text = rearrange(text_feats, "bs n d -> bs 1 1 n d")
+            mat_image_all = rearrange(image_feats_all, "(bs ngpus) n d -> (bs ngpus) n d 1", bs=self.B)
+            sim_t2i = torch.matmul(mat_text, mat_image_all).squeeze(-1)
+
+            target_pos_idx = torch.randperm(num_positive_samples)[:self.B].unsqueeze(-1)
+            target_pos_ids = pos_ids.gather(1, target_pos_idx)
+            abs_diff = torch.abs(pos_ids - target_pos_ids)
+
+            schedule = self.c2f_schedule.repeat(self.B, 1).gather(1, abs_diff)
+            targets = self.pos_or_neg * schedule.unsqueeze(-1)
+
+            selected_sim_i2t = torch.stack([sim_i2t[i].index_select(1, target_pos_idx[i]) for i in range(self.B)])
+            selected_sim_i2t = selected_sim_i2t.squeeze(-1)
+            selected_sim_t2i = torch.stack([sim_t2i[i].index_select(1, target_pos_idx[i]) for i in range(self.B)])
+            selected_sim_t2i = selected_sim_t2i.squeeze(-1)
+
+            loss_c2f_itc = (
+                F.cross_entropy(selected_sim_i2t, targets, label_smoothing=0.1)
+                + F.cross_entropy(selected_sim_i2t, targets, label_smoothing=0.1)
+            )
+
+
+
         elif self.stage == 2:
             if self.cfg.stage2.bypass_codebook:
                 loss = self.get_stage_2_loss_bypass_codebook(batch, batch_idx)
@@ -1246,13 +1322,6 @@ if __name__ == "__main__":
 
     os.makedirs(cfg.result_file_path, exist_ok=True)
 
-    datamodule = SEEDDataModule(cfg, transform=transform)
-    datamodule.setup()
-    train_dataloader = datamodule.train_dataloader()
-    val_dataloader = datamodule.val_dataloader()
-
-    cfg.experiment.total_training_steps = datamodule.total_training_steps
-
     tb_logger = pl_loggers.TensorBoardLogger(save_dir=cfg.result_file_path)
     lr_logger = pl.callbacks.LearningRateMonitor(logging_interval="step")
 
@@ -1279,6 +1348,13 @@ if __name__ == "__main__":
         raise ValueError("Only checkpoint or finetune")
 
     wrapper = SEEDTrainingWrapper(cfg).to(device)
+
+    datamodule = SEEDDataModule(cfg, tokenizer=wrapper.text_tokenizer, transform=transform)
+    datamodule.setup()
+    train_dataloader = datamodule.train_dataloader()
+    val_dataloader = datamodule.val_dataloader()
+
+    cfg.experiment.total_training_steps = datamodule.total_training_steps
 
     if cfg.load_weight:
         wrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg)

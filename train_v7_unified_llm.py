@@ -44,7 +44,6 @@ from utils.config import build_config
 
 from lavis.models import load_model
 from lavis.common.dist_utils import is_dist_avail_and_initialized
-from functools import partial
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
@@ -121,14 +120,6 @@ class SEEDTrainingWrapper(LightningModule):
         self.stage = cfg.experiment.stage
         self.temp = nn.Parameter(0.07 * torch.ones([]))
 
-        # For SDS
-        t_range = [0.2, 0.6]
-        # t_range = [0.02, 0.98]
-        self.num_train_timesteps = 1000
-        self.min_step = int(self.num_train_timesteps * t_range[0])
-        self.max_step = int(self.num_train_timesteps * t_range[1])
-        self.alphas = self.image_noising_scheduler.alphas_cumprod  # for convenience
-
     def setup(self, stage):
         # Setup training parameter
         self.image_tokenizer.model.train()
@@ -189,42 +180,9 @@ class SEEDTrainingWrapper(LightningModule):
             self.image_tokenizer.model.distill_image_proj = self.image_tokenizer.model.distill_image_proj.to("cpu") 
         elif self.stage == 2:
             self.random_initialize_stage2_model_weights()
-            if self.cfg.stage2.train_unet:
-                self.make_unet_trainable_for_img_embeds()
-
+            
         ## make dump folder
         os.makedirs(self.cfg.result_file_path, exist_ok=True)
-
-    def make_unet_trainable_for_img_embeds(self):
-        for p in self.image_tokenizer.diffusion_model.unet.parameters():
-            p.requires_grad = False
-
-        for p in self.image_tokenizer.diffusion_model.unet.class_embedding.parameters():
-            p.requires_grad = True
-
-        for block in self.image_tokenizer.diffusion_model.unet.down_blocks:
-            try:
-                for resnet in block.resnets:
-                    for p in resnet.time_emb_proj.parameters():
-                        p.requires_grad = True
-            except Exception as e:
-                print(e)
-                continue
-
-        for block in self.image_tokenizer.diffusion_model.unet.up_blocks:
-            try:
-                for resnet in block.resnets:
-                    for p in resnet.time_emb_proj.parameters():
-                        p.requires_grad = True
-            except Exception as e:
-                print(e)
-                continue
-
-        for resnet in self.image_tokenizer.diffusion_model.unet.mid_block.resnets:
-            for p in resnet.time_emb_proj.parameters():
-                p.requires_grad = True
-
-
     
     def random_initialize_stage2_model_weights(self):
         """Random initialize stage 2 model weights
@@ -255,7 +213,7 @@ class SEEDTrainingWrapper(LightningModule):
         for param in self.image_tokenizer.model.distill_image_proj.parameters():
             nn.init.normal_(param, mean=0.0, std=0.02)
             param.requires_grad = True
-
+        
     def save_config(self):
         config_save_path = os.path.join(self.logger.log_dir, "config.yaml")
         with open(config_save_path, "w") as f:
@@ -337,13 +295,8 @@ class SEEDTrainingWrapper(LightningModule):
             quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
             embed_ind = embed_ind.reshape(quant.shape[0], -1)
 
-        if bypass_codebook:
-            # # [b, 32, 32] => [b, 32, 768]
-            query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
-        else:
-            quant_embedding = self.image_tokenizer.model.quantize.get_codebook_entry(embed_ind)
-            # # [b, 32, 32] => [b, 32, 768]
-            query_output_up = self.image_tokenizer.model.decode_task_layer(quant_embedding)
+        # [b, 32, 32] => [b, 32, 768]
+        query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
 
         # [b, 32, 768] => [b, 32, 768]
         query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
@@ -353,26 +306,44 @@ class SEEDTrainingWrapper(LightningModule):
 
         return reverse_output_proj
 
-    def logging_train_stage2(self, clip_cosine_similarity, loss_dict):
+    def logging_train_stage2(self, generation_embedding_cosine_similarity, loss_dict):
         self.log(
-            "train/clip_cosine_similarity",
-            clip_cosine_similarity,
+            "train/generation_embedding_mse_loss",
+            loss_dict["loss_generation_embed"].mean(),
             on_step=True,
             on_epoch=True,
             prog_bar=True,
             logger=True,
         )
 
-        for loss_name, loss_value in loss_dict.items():
+        if "loss_embed" in loss_dict.keys():
             self.log(
-                f'train/{loss_name}',
-                loss_value,
+                "train/codebook_loss_embed",
+                loss_dict["loss_embed"].mean(),
                 on_step=True,
                 on_epoch=True,
                 prog_bar=True,
                 logger=True,
             )
 
+        self.log(
+            "train/reconstruction_loss",
+            loss_dict["loss_recon"].mean(),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+
+        self.log(
+            "train/total_loss",
+            loss_dict["loss"].mean(),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+    
     def all_gather_with_grad(self, tensors):
         """
         Performs all_gather operation on the provided tensors.
@@ -747,106 +718,6 @@ class SEEDTrainingWrapper(LightningModule):
 
         return
 
-    def sds_loss(
-            self,
-            image_embeds,
-            clean_image,
-            guidance_scale=100,
-            grad_scale=1,
-            prompt=None,
-            prompt_embeds=None,
-    ):
-        """Score distillation sampling"""
-        if prompt is None and prompt_embeds is None:
-            # prompt = len(image) * [""] if isinstance(image, list) else ""
-            # Changed because we get image_embeds as input
-            prompt = image_embeds.shape[0] * [""] if isinstance(image_embeds, torch.Tensor) else ""
-
-        # 2. Define call parameters
-        batch_size = image_embeds.shape[0]
-
-        device = image_embeds.device
-
-        # Convert images to latent space
-        # latents = self.vae.encode(clean_image).latent_dist.sample()
-        # latents = latents * self.vae.config.scaling_factor
-
-        # 3. Encode input prompt
-
-        # [b, 77, 1024]
-        # Now img2img, prompt_embeds is None
-        prompt_embeds = self.image_tokenizer.diffusion_model._encode_prompt(
-            prompt=prompt,
-            device=device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=True,
-            negative_prompt=None,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=None,
-            lora_scale=None,
-        )
-
-        image_embeds = self.image_tokenizer.diffusion_model._encode_image(
-            image=None,
-            device=device,
-            batch_size=batch_size,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=True,
-            noise_level=0,
-            generator=None,
-            image_embeds=image_embeds,
-            negative_image_embeds=None,
-        )
-        do_classifier_free_guidance = True
-
-        latents = self.vae.encode(clean_image).latent_dist.sample()
-        latents = latents * self.vae.config.scaling_factor
-
-        # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
-        t = torch.randint(
-            self.min_step, self.max_step + 1, [1], dtype=torch.long, device=device
-        )
-
-        # predict the noise residual with unet, NO grad!
-        with torch.no_grad():
-            # add noise
-            noise = torch.randn_like(latents)
-            latents_noisy = self.scheduler.add_noise(latents, noise, t)
-            # pred noise
-            latent_model_input = torch.cat([latents_noisy] * 2)
-
-        noise_pred = self.unet(
-            latent_model_input,
-            t,
-            encoder_hidden_states=prompt_embeds,
-            class_labels=image_embeds,
-        ).sample
-
-        # perform guidance (high scale from paper!)
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-
-        noise_pred = noise_pred_uncond + guidance_scale * (
-                noise_pred_text - noise_pred_uncond
-        )
-
-        # w(t), sigma_t^2
-        self.alphas = self.alphas.to(device)
-        w = 1 - self.alphas[t]
-        grad = grad_scale * w * (noise_pred - noise)
-        grad = torch.nan_to_num(grad)
-
-        targets = (latents - grad)
-        # loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='sum') / latents.shape[0]
-        # Why not mean?
-        loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='mean')
-
-        return loss
-
-    def clip_loss(self, image_embeds, gt_img_clip_embeddings):
-        similarity_target = torch.ones(image_embeds.shape[0], device=image_embeds.device)
-        loss_clip = torch.nn.functional.cosine_embedding_loss(image_embeds, gt_img_clip_embeddings, similarity_target)
-        return loss_clip
-
     def get_stage_2_loss_bypass_codebook(self, batch, batch_idx: int):
         """_summary_
 
@@ -864,7 +735,6 @@ class SEEDTrainingWrapper(LightningModule):
         #------------------------
         with torch.no_grad():
             causal_embeddings = self.get_causal_embeddings(img)
-            gt_img_clip_embeddings = self.get_clip_img_embedding(img)
 
         # TODO: query_output should be trained to be similar with text embedding
         # Image embedding is cross attentioned.
@@ -893,50 +763,33 @@ class SEEDTrainingWrapper(LightningModule):
 
         #loss_recon = F.cosine_similarity(query_output_up, causal_embeddings).mean()
         loss_recon = F.mse_loss(query_output_up, causal_embeddings)
-        loss_dict = {
-            "loss_recon": loss_recon,
-        }
-        loss_total = self.cfg.experiment.recon_loss_weight * loss_recon
-
+                
         #------------------------
         # Stage 2 - 3 : Reconstruction Generation Embedding
         #------------------------
 
         # MLP
         # query_output_up = causal_embeddings
-        image_embeds = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
-        gt_img_clip_embeddings.requires_grad = False
+        reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
 
-        sds_loss_weight = self.cfg.experiment.sds_loss_weight * self.sds_loss_weights[self.global_step]
-        if self.cfg.experiment.clip_loss_weight > 0:
-            loss_clip = F.mse_loss(image_embeds, gt_img_clip_embeddings)
-            # loss_clip = self.clip_loss(image_embeds, gt_img_clip_embeddings)
-            loss_dict['clip_loss'] = loss_clip
-            _loss_clip = self.cfg.experiment.clip_loss_weight * loss_clip
-            if self.cfg.experiment.cross_annealing:
-                _loss_clip *= (1 - sds_loss_weight)
-            loss_total += _loss_clip
+        gt_img_clip_embeddings = self.get_clip_img_embedding(img)
+    
+        loss_generation_embed = F.mse_loss(reverse_output_proj, gt_img_clip_embeddings)
 
-        if sds_loss_weight > 0:
-            loss_sds = self.sds_loss(
-                image_embeds=image_embeds,
-                clean_image=img,
-                guidance_scale=10,
-                grad_scale=1,
-            )
+        loss_total = loss_recon + loss_generation_embed
+        loss_total = loss_total.mean()
+        
+        loss_dict = {"loss_generation_embed": loss_generation_embed,
+                    # "loss_embed": loss_embed,
+                     "loss_recon": loss_recon,
+                     "loss": loss_total}
 
-            loss_dict['loss_sds'] = loss_sds
-            loss_dict['sds_weight'] = sds_loss_weight
-            loss_total += sds_loss_weight * loss_sds
-
-        loss_dict['loss'] = loss_total
         #------------------------
         # Logging
         #------------------------
-        with torch.no_grad():
-            clip_cosine_similarity = F.cosine_similarity(image_embeds, gt_img_clip_embeddings).mean()
+        generation_embedding_cosine_similarity = F.cosine_similarity(reverse_output_proj, gt_img_clip_embeddings).mean()
 
-        self.logging_train_stage2(clip_cosine_similarity, loss_dict)
+        self.logging_train_stage2(generation_embedding_cosine_similarity, loss_dict)
 
         return loss_total
 
@@ -1100,7 +953,7 @@ class SEEDTrainingWrapper(LightningModule):
                 )
     
     def on_validation_epoch_start(self):
-        os.makedirs(f"{self.cfg.result_file_path}/{self.current_epoch}", exist_ok=True)
+        return
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx: int, save_path=None):
@@ -1214,17 +1067,6 @@ class SEEDTrainingWrapper(LightningModule):
             num_training_steps=num_training_steps
         )
 
-        if self.cfg.experiment.sds_loss_weight > 0 and self.cfg.experiment.use_sds_loss_schedule:
-            _num_training_steps = num_training_steps // 8
-            def f(current_step: int):
-                return 1 - max(0.0, float(_num_training_steps - current_step) / float(_num_training_steps))
-        else:
-            def f(current_step: int):
-                return 1
-
-        x = np.arange(0, num_training_steps)
-        self.sds_loss_weights = np.array(list(map(f, x)))
-
         lr_scheduler_config = {
             "scheduler": scheduler,
             "name": "learning_rate",
@@ -1234,6 +1076,47 @@ class SEEDTrainingWrapper(LightningModule):
 
         return {"optimizer": optimizer,
                 "lr_scheduler": lr_scheduler_config,}
+        
+    @torch.no_grad()
+    def encode_image(self, image_torch):
+        with torch.no_grad():
+            '''Convert a batch of img to code
+            Args:
+                model: The tokenizer model.
+                img: [b, c, h, w]
+            '''
+            if len(image_torch.shape) == 3:
+                image_torch = image_torch.unsqueeze(0)
+            
+            causal_embeddings = self.get_causal_embeddings(image_torch)
+            query_output_down = self.image_tokenizer.model.encode_task_layer(causal_embeddings)
+            quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
+            return embed_ind
+    
+    @torch.no_grad()
+    def decode_image(self, embed_ind):
+        with torch.no_grad():
+            embed_ind = rearrange(embed_ind, 'n -> 1 n')
+            '''Convert a batch of code to img
+            Args:
+                model: The tokenizer model.
+                code: [b, 32, 32]
+            '''
+            quant = self.image_tokenizer.model.quantize.get_codebook_entry(embed_ind)
+            query_output_up = self.image_tokenizer.model.decode_task_layer(quant)
+            query_output_up = self.image_tokenizer.model.get_transformer_decoded_embedding(query_output_up)
+            reverse_output_proj = self.image_tokenizer.model.get_mlp_decoded_embedding(query_output_up)
+            # print diffusion_model weight type
+            reconstructed_images = self.image_tokenizer.diffusion_model(
+                    image_embeds=reverse_output_proj,
+                    negative_image_embeds=None,
+                    guidance_scale=10,
+                    noise_level=0,
+                    # latents=self.image_tokenizer.latents,
+                ).images
+        
+        return reconstructed_images
+        
         
 if __name__ == "__main__":
     cfg, cfg_yaml = build_config()
@@ -1255,6 +1138,11 @@ if __name__ == "__main__":
 
     tb_logger = pl_loggers.TensorBoardLogger(save_dir=cfg.result_file_path)
     lr_logger = pl.callbacks.LearningRateMonitor(logging_interval="step")
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        save_top_k=3,
+        monitor="clip_score_coco_karpathy" if cfg.experiment.stage == 2 else "val/loss",
+        mode="max",
+    )
 
     trainer = pl.Trainer(
         accelerator=device,
@@ -1265,12 +1153,12 @@ if __name__ == "__main__":
         deterministic=cfg.experiment.deterministic,
         logger=tb_logger,
         log_every_n_steps=cfg.experiment.log_every_n_steps,
-        val_check_interval=cfg.experiment.val_check_interval,
-        # check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
+        # val_check_interval=cfg.experiment.val_check_interval,
+        check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
         enable_checkpointing=cfg.experiment.enable_checkpointing,
         num_sanity_val_steps=cfg.experiment.num_sanity_val_steps,
         precision=str(cfg.optimizer.precision),
-        callbacks=[ModelSummary(max_depth=3), lr_logger],
+        callbacks=[ModelSummary(max_depth=3), lr_logger] + [checkpoint_callback] if cfg.experiment.enable_checkpointing else [],
         accumulate_grad_batches=cfg.experiment.grad_accumulation,
         gradient_clip_val=cfg.optimizer.grad_clip_val,
     )

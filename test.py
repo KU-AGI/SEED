@@ -2,10 +2,11 @@ import hydra
 from omegaconf import OmegaConf
 import torch
 from PIL import Image
-from our_tokenizer import SEEDTrainingWrapper
+#from our_tokenizer import SEEDTrainingWrapper
+from train_v7_unified_llm import SEEDTrainingWrapper
 from einops import rearrange
 
-cfg_path = './configs/our_seed_tokenizer.yaml'
+cfg_path = 'configs/seed_unified_test.yaml'
 cfg = OmegaConf.load(cfg_path)
 visual_tokenizer = SEEDTrainingWrapper.load_from_checkpoint('/home/zheedong/Projects/SEED/logs/seed_stage2_proj/lightning_logs/stage2_w_codebook_40epoch/checkpoints/epoch=39-step=7840.ckpt', cfg=cfg, strict=False, map_location="cpu")
 visual_tokenizer.eval()
@@ -45,7 +46,7 @@ with torch.no_grad():
 
 print(img_ids)
 
-
+import pdb; pdb.set_trace()
 save_path_new = "images/cat_new.jpg"
 
 with torch.no_grad():

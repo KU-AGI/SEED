@@ -480,6 +480,7 @@ class SEEDTrainingWrapper(LightningModule):
 
         with torch.no_grad():
             clip_cosine_similarity = F.cosine_similarity(image_embeds, gt_img_clip_embeddings).mean()
+        # loss_recon = F.mse_loss(image_embeds, gt_img_clip_embeddings)
 
         self.log(
             "train/loss_sds",

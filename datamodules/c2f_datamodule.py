@@ -3,7 +3,6 @@ import yaml
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 from PIL import Image
 import json
-#from model.tokenizer import Tokenizer
 import copy
 import torchvision.transforms as transforms
 import numpy as np
@@ -17,16 +16,16 @@ from pycocotools.coco import COCO
 from coco_dataloader import CocoDataset
 import torch.utils.data as data
 
-import hydra
-from omegaconf import OmegaConf
 import random
 import pytorch_lightning as pl
 
-class FinetuneData(IterableDataset):
+
+
+class C2FFinetuneData(IterableDataset):
     def __init__(self,
                  config_path,
+                 num_positive_samples: int,
                  transform=None,
-                 max_words=30,
                  tokenizer=None,
                  shardshuffle=100,
                  resampled=True,
@@ -46,8 +45,11 @@ class FinetuneData(IterableDataset):
             self.total_num_samples += num_samples
 
         self.transform = transform
-        self.max_words = max_words
         self.tokenizer = tokenizer
+        self.num_positive_samples = num_positive_samples
+        self.max_num_positive_samples = 32
+
+        self.target_ids = list(range(self.num_positive_samples))
 
         if 'CONTAIN_TEXT' in self.config.keys():
             self.contain_txt = self.config['CONTAIN_TEXT']
@@ -133,14 +135,37 @@ class FinetuneData(IterableDataset):
         text_tokens = self.tokenize(text)
         return text_tokens
 
+    def rescale_ids(self, ids, num_samples):
+        ret = []
+        step_size = self.max_num_positive_samples // num_samples
+        for _id in ids:
+            st = _id * step_size
+            ed = min(st + step_size, self.max_num_positive_samples)
+            interval = list(range(st, ed))
+            ret.append(random.choice(interval))
+        return ret
+
     def __iter__(self):
         if self.contain_txt:
             for i, (img, txt_tokens, meta) in enumerate(self.dataset):
                 yield img, txt_tokens
         else:
             for i, (img, meta) in enumerate(self.dataset):
-                caption = meta['capsfusion']
-                yield img, caption
+                captions = meta['sc']
+                ids = list(range(len(captions)))
+                sampled_ids = sorted(random.sample(ids, self.num_positive_samples))
+                _captions = [captions[_id] for _id in sampled_ids][::-1]
+                pos_ids = 32 - np.array(self.rescale_ids(sampled_ids, len(captions))[::-1])
+
+                text_tokens = self.tokenizer(
+                    _captions,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=300,
+                    return_tensors="pt",
+                )
+
+                yield img, pos_ids, text_tokens.input_ids, text_tokens.attention_mask
 
     def groups(self):
         return list(self.group_indices.values())
@@ -228,7 +253,7 @@ def pack(token_sequences, max_seq_len=128, batch_size=3):
     return packed_ds
 
 class SEEDDataModule(pl.LightningDataModule):
-    def __init__(self, cfg, transform=None, use_coco_val=True):
+    def __init__(self, cfg, tokenizer=None, transform=None, use_coco_val=True):
         super().__init__()
         self.cfg = cfg
         self.dataset_configs = cfg.dataset.train_config.dataset_configs
@@ -242,7 +267,10 @@ class SEEDDataModule(pl.LightningDataModule):
         self.val_batch_size = cfg.experiment.val_batch_size
         self.num_workers = cfg.dataset.num_workers
         self.n_gpus = cfg.dist.n_gpus
+
+        self.tokenizer = tokenizer
         self.transform = transform
+
 
         self.one_epoch_data_size = cfg.dataset.train_config.one_epoch_data_size
         self.total_training_steps = ((cfg.experiment.max_epochs * self.one_epoch_data_size) / self.n_gpus) / self.local_batch_size
@@ -253,8 +281,10 @@ class SEEDDataModule(pl.LightningDataModule):
         datasets = []
         for config in self.dataset_configs:
             datasets.append(
-                FinetuneData(
+                C2FFinetuneData(
                     config,
+                    self.cfg.experiment.num_positive_samples,
+                    tokenizer=self.tokenizer,
                     shardshuffle=self.shardshuffle,
                     resampled=self.resampled,
                     world_size=self.world_size,
@@ -281,13 +311,14 @@ class SEEDDataModule(pl.LightningDataModule):
                 end_index=end_index,
             )
         else:
-            self.val_one_epoch_data_size = self.cfg.dataset.val_config.one_epoch_data_size
             self.val_dataset_configs = self.cfg.dataset.val_config.dataset_configs
             val_datasets = []
             for config in self.val_dataset_configs:
                 val_datasets.append(
-                    FinetuneData(
+                    C2FFinetuneData(
                         config,
+                        1,
+                        tokenizer=self.tokenizer,
                         shardshuffle=self.shardshuffle,
                         resampled=self.resampled,
                         world_size=self.world_size,
@@ -299,7 +330,7 @@ class SEEDDataModule(pl.LightningDataModule):
                 datasets=val_datasets,
                 rank=0,
                 world_size=self.world_size,
-                length=self.val_one_epoch_data_size/self.n_gpus,
+                length=self.one_epoch_data_size/self.n_gpus,
                 weights=self.val_weights,
             )
 
@@ -307,7 +338,7 @@ class SEEDDataModule(pl.LightningDataModule):
         return DataLoader(
             self.train_dataset,
             batch_size=self.local_batch_size,
-            num_workers=self.num_workers,
+            # num_workers=self.num_workers,
         )
 
     def val_dataloader(self):
@@ -316,13 +347,13 @@ class SEEDDataModule(pl.LightningDataModule):
                 self.validation_dataset,
                 batch_size=self.val_batch_size,
                 collate_fn=self.validation_dataset.collate_fn,
-                num_workers=self.num_workers,
+                # num_workers=self.num_workers,
             )
         else:
             return DataLoader(
                 self.validation_dataset,
                 batch_size=self.val_batch_size,
-                num_workers=self.num_workers,
+                # num_workers=self.num_workers,
             )
 
     def test_dataloader(self):
