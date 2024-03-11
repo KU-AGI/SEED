@@ -19,4 +19,5 @@ data/cc3m_*
 logs_old/*
 datamodules/cc3m_index.json
 eval_legacy/evaluation/pycocoevalcap/*
+data/long_caption_dataset/*
 ```
