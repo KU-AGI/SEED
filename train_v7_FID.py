@@ -47,6 +47,12 @@ from utils.config import build_config
 from lavis.models import load_model
 from lavis.common.dist_utils import is_dist_avail_and_initialized
 
+# setup for reproducibility
+# https://pytorch.org/docs/stable/notes/randomness.html#avoiding-nondeterministic-algorithms
+torch.use_deterministic_algorithms(True)
+# https://docs.nvidia.com/cuda/cublas/index.html#results-reproducibility
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 BOI_TOKEN = "<img>"
@@ -73,6 +79,8 @@ class SEEDTrainingWrapper(LightningModule):
             model_path=cfg.checkpoint_path.model_path,
             diffusion_model_path=cfg.checkpoint_path.diffusion_model_path,
             load_diffusion=cfg.stage2.load_diffusion,
+            vq_type=cfg.stage2.vq.type,
+            discarding_threshold=cfg.stage2.vq.discarding_threshold,
             from_pretrained=True if cfg.stage1.init == "SEED" else False,
             vit_precision=cfg.optimizer.vit_precision,
             diffusion_precision=cfg.optimizer.diffusion_precision,
@@ -141,7 +149,7 @@ class SEEDTrainingWrapper(LightningModule):
         else:
             # Quantize
             print("Quantize")
-            quant, loss_embed, embed_ind = self.image_tokenizer.model.quantize(query_output_down)
+            quant, loss_embed, embed_ind, perplexity = self.image_tokenizer.model.quantize(query_output_down)
             embed_ind = embed_ind.reshape(quant.shape[0], -1)
 
         # [b, 32, 32] => [b, 32, 768]
@@ -165,6 +173,13 @@ class SEEDTrainingWrapper(LightningModule):
         _, _, image_name = batch
         bypass_codebook = self.cfg.stage2.bypass_codebook
 
+        # seed fix
+        seed = self.cfg.experiment.seed
+        num_images_per_prompt = len(image_name)
+        generators = [torch.Generator(device="cuda") for _ in range(num_images_per_prompt)]
+        for i, generator in enumerate(generators):
+            generator.manual_seed(seed)
+
         with torch.no_grad():
             image_embeds = self.forward_stage_2(batch, batch_idx, bypass_codebook)
             reconstructed_images = self.image_tokenizer.diffusion_model(
@@ -173,9 +188,10 @@ class SEEDTrainingWrapper(LightningModule):
                 guidance_scale=10,
                 noise_level=0,
                 latents=self.image_tokenizer.latents,
+                generator=generators,
             ).images
 
-        save_path = f"{tb_log_dir}/images/version_{self.logger.version}/COCOVal30000"
+        save_path = f"{tb_log_dir}/images/version_{self.logger.version}/{self.cfg.image_save_path}"
         os.makedirs(save_path, exist_ok=True)
 
         for img, cur_name in zip(reconstructed_images, image_name):
@@ -199,18 +215,19 @@ if __name__ == "__main__":
     from datamodules.datasets.coco_val import COCOValDataSet
     from torch.utils.data import DataLoader
 
-    mode = 5000  # 30000 or 5000
+
+    mode = cfg.dataset.val_config.mode
 
     print(f"Load {mode} images from COCO Validation.")
-    if mode == 30000:
+    if mode == 'val 30000':
         test_dataset = COCOValDataSet(transform=transform)
     else:
         test_dataset = CocoDataset(
             root_dir=cfg.dataset.val_config.root_dir,
             karpathy_file=cfg.dataset.val_config.karpathy_file_path,
             tokenizer=None,
-            start_index=0,
-            end_index=5000,
+            start_index=cfg.dataset.val_config.start_index,
+            end_index=cfg.dataset.val_config.end_index,
         )
     
     print(f"Test dataset length: {len(test_dataset)}")
@@ -218,7 +235,7 @@ if __name__ == "__main__":
     test_dataloader = DataLoader(
         test_dataset,
         batch_size=cfg.experiment.val_batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=cfg.dataset.num_workers,
         pin_memory=True,
         drop_last=True,
@@ -238,8 +255,10 @@ if __name__ == "__main__":
         logger=tb_logger,
     )
 
-    wrapper = SEEDTrainingWrapper(cfg).to(device)
-    # wrapper = SEEDTrainingWrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg, strict=False).to(device)
+    if cfg.load_weight:
+        wrapper = SEEDTrainingWrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg, strict=False).to(device)
+    else:
+        wrapper = SEEDTrainingWrapper(cfg).to(device)
 
     trainer.test(wrapper, dataloaders=test_dataloader)
 

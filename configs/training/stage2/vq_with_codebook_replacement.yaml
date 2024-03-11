@@ -2,7 +2,7 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/precision_test
+result_file_path: ./logs/vq_with_codebook_replacement
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
@@ -10,13 +10,21 @@ checkpoint_path:
 resume: False
 load_weight: False
 weight_path: None
+# weight_path: /home/ubuntu/Projects/SEED_Tokenizer/logs/current_training/nsvq_with_codebook_replacement/checkpoints/epoch=0-step=2000.ckpt
 eval: False
 
 dist:
-  n_gpus: 4
+  n_gpus: 2
   n_nodes: 1
 
 dataset:
+  train_config:
+    dataset_configs: ['configs/data/cc15m.yaml', 'configs/data/laion-coco.yaml', 'configs/data/mscoco.yaml']
+    weights: [1, 8, 1]
+    shardshuffle: 100
+    resampled: True
+    world_size: 1
+    one_epoch_data_size: 1000000
   val_config:
     use_coco_val: True
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
@@ -33,6 +41,11 @@ stage1:
 stage2:
   bypass_codebook: False
   load_diffusion: True
+  vq:
+    type: 'vq2' # ['vq2', 'ema_vq', nsvq']
+    replace_codes: True
+    replacement_num_batches: 500
+    discarding_threshold: 0.1
 
 experiment:
   seed: 0
@@ -40,10 +53,11 @@ experiment:
   local_batch_size: 1024
   val_batch_size: 16
   test_split: train
-  max_epochs: 1
+  max_epochs: 40
   deterministic: False
   grad_accumulation: 1
-  check_val_every_n_epoch: 1
+  # check_val_every_n_epoch: 1
+  val_check_interval: 200
   enable_checkpointing: True
   log_every_n_steps: 1
   num_sanity_val_steps: 1
@@ -52,7 +66,7 @@ experiment:
 
 optimizer:
   vit_precision: 'fp16'
-  diffusion_precision: 'fp32'
+  diffusion_precision: 'fp16'
   precision: 'bf16'
   max_lr: 7e-4
 

@@ -1,0 +1,4 @@
+META:
+  - ["/ssd0/data/laion-coco-final-sc-wds/{00001..02319}_000000.tar", 23200000]
+
+CONTAIN_TEXT: False

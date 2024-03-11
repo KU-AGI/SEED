@@ -2,24 +2,24 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/capsfusion_dci_llava_long_caption_last_token
+result_file_path: ./logs/long_vs_short_caption
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
 
-resume: False
+resume: True
 load_weight: False
-weight_path: None
+weight_path: '/home/zheedong/Projects/SEED/logs/long_vs_short_caption/lightning_logs/version_4/checkpoints/long_caption_epoch=6-step=24000.ckpt'
 eval: False
 
 dist:
-  n_gpus: 4
+  n_gpus: 2
   n_nodes: 1
 
 dataset:
   train_config:
-    dataset_configs: ['configs/data/laion_capsfusion.yaml', 'configs/data/dci_llava.yaml', 'configs/data/coco_karpathy_train.yaml']
-    weights: [1000, 1, 1]
+    dataset_configs: ['configs/data/laion_capsfusion.yaml', 'configs/data/dci_llava.yaml']
+    weights: [370, 1]
     shardshuffle: 100
     resampled: True
     world_size: 1
@@ -31,17 +31,22 @@ dataset:
     shardshuffle: 100
     resampled: True
     world_size: 1
-    one_epoch_data_size: 1000
+    one_epoch_data_size: 5000
   num_workers: 16
   shuffle: True
   text_max_length: 512
 
 stage1:
-  init: 'SEED'
+  init: 'BLIP-2'
 
 stage2:
   bypass_codebook: False
   load_diffusion: False
+  vq:
+    type: 'vq2' # ['vq2', 'ema_vq', nsvq']
+    replace_codes: True
+    replacement_num_batches: 1000
+    discarding_threshold: 0.1
 
 experiment:
   seed: 0
@@ -49,7 +54,7 @@ experiment:
   local_batch_size: 128
   val_batch_size: 256
   test_split: train
-  max_epochs: 40
+  max_epochs: 10
   deterministic: False
   grad_accumulation: 1
   val_check_interval: 0.2
@@ -64,7 +69,7 @@ optimizer:
   vit_precision: 'fp16'
   diffusion_precision: 'fp16'
   precision: 'bf16'
-  max_lr: 7e-7
+  max_lr: 5e-6
 
 hyperparameters:
   beta_1: 0.9

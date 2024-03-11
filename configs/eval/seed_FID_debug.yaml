@@ -6,24 +6,27 @@ result_file_path: ./logs/precision_test
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
+image_save_path: fp16_5000
 
 resume: False
 load_weight: False
+# weight_path: /home/zheedong/Projects/SEED/logs/seed_FID_test_trained_weight/nsvq_v3
+# weight_path: /home/zheedong/Projects/SEED/logs/seed_FID_test_trained_weight/vq2.ckpt
 weight_path: None
 eval: False
 
 dist:
-  n_gpus: 4
+  n_gpus: 1
   n_nodes: 1
 
 dataset:
   val_config:
-    use_coco_val: True
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
     root_dir: /ssd0/data/coco/images/val2014
+    mode: 'karpathy test'  # Choose from 'karpathy test', 'val 30000'
     start_index: 0
-    end_index: 256
-  num_workers: 16
+    end_index: None
+  num_workers: 8
   shuffle: True
   text_max_length: 128
 
@@ -33,6 +36,11 @@ stage1:
 stage2:
   bypass_codebook: False
   load_diffusion: True
+  vq:
+    type: 'vq2' # ['vq2', 'ema_vq', nsvq']
+    replace_codes: True
+    replacement_num_batches: 500
+    discarding_threshold: 0.1
 
 experiment:
   seed: 0
@@ -41,23 +49,9 @@ experiment:
   val_batch_size: 16
   test_split: train
   max_epochs: 1
-  deterministic: False
-  grad_accumulation: 1
-  check_val_every_n_epoch: 1
-  enable_checkpointing: True
-  log_every_n_steps: 1
-  num_sanity_val_steps: 1
-  num_warmup_steps: 200
-  grad_clip_val: 0.5
+  deterministic: True
 
 optimizer:
   vit_precision: 'fp16'
-  diffusion_precision: 'fp32'
+  diffusion_precision: 'fp16'
   precision: 'bf16'
-  max_lr: 7e-4
-
-hyperparameters:
-  beta_1: 0.9
-  beta_2: 0.999
-  weight_decay: 1e-8
-

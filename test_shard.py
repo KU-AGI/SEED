@@ -1,1 +1,0 @@
-/ssd0/data/laion_capsfusion/test_shard.py

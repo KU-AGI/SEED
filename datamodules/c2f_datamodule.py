@@ -31,6 +31,7 @@ class C2FFinetuneData(IterableDataset):
                  resampled=True,
                  world_size=1,
                  rank=0,
+                 max_token_length=128
                  ):
         print(f"read dataset config from {config_path}")
         with open(config_path, 'r') as f:
@@ -48,6 +49,7 @@ class C2FFinetuneData(IterableDataset):
         self.tokenizer = tokenizer
         self.num_positive_samples = num_positive_samples
         self.max_num_positive_samples = 32
+        self.max_token_length = max_token_length
 
         self.target_ids = list(range(self.num_positive_samples))
 
@@ -106,7 +108,7 @@ class C2FFinetuneData(IterableDataset):
                     initial=(0 if shardshuffle is None else 100),
                 )
                 .decode("pil", handler=wds.ignore_and_continue)
-                .to_tuple("jpg", "txt", "json")
+                .to_tuple("jpg", "json")
                 .map_tuple(
                     transform,
                     self.identity, 
@@ -155,13 +157,13 @@ class C2FFinetuneData(IterableDataset):
                 ids = list(range(len(captions)))
                 sampled_ids = sorted(random.sample(ids, self.num_positive_samples))
                 _captions = [captions[_id] for _id in sampled_ids][::-1]
-                pos_ids = 32 - np.array(self.rescale_ids(sampled_ids, len(captions))[::-1])
+                pos_ids = (self.max_num_positive_samples - 1) - np.array(self.rescale_ids(sampled_ids, len(captions))[::-1])
 
                 text_tokens = self.tokenizer(
                     _captions,
                     padding="max_length",
                     truncation=True,
-                    max_length=300,
+                    max_length=self.max_token_length,
                     return_tensors="pt",
                 )
 
@@ -289,6 +291,7 @@ class SEEDDataModule(pl.LightningDataModule):
                     resampled=self.resampled,
                     world_size=self.world_size,
                     transform=self.transform,
+                    max_token_length=self.cfg.experiment.max_token_length
                 )
             )
         
@@ -323,6 +326,7 @@ class SEEDDataModule(pl.LightningDataModule):
                         resampled=self.resampled,
                         world_size=self.world_size,
                         transform=self.transform,
+                        max_token_length=self.cfg.experiment.max_token_length
                     )
                 )
             self.validation_dataset = CombinedDataset(
@@ -338,7 +342,7 @@ class SEEDDataModule(pl.LightningDataModule):
         return DataLoader(
             self.train_dataset,
             batch_size=self.local_batch_size,
-            # num_workers=self.num_workers,
+            num_workers=self.num_workers,
         )
 
     def val_dataloader(self):
@@ -347,13 +351,13 @@ class SEEDDataModule(pl.LightningDataModule):
                 self.validation_dataset,
                 batch_size=self.val_batch_size,
                 collate_fn=self.validation_dataset.collate_fn,
-                # num_workers=self.num_workers,
+                num_workers=self.num_workers,
             )
         else:
             return DataLoader(
                 self.validation_dataset,
                 batch_size=self.val_batch_size,
-                # num_workers=self.num_workers,
+                num_workers=self.num_workers,
             )
 
     def test_dataloader(self):

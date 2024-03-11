@@ -2,30 +2,41 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/precision_test
+result_file_path: ./logs/stage1_check_similarity
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
 
 resume: False
-load_weight: False
-weight_path: None
+load_weight: True
+# weight_path: /home/zheedong/Projects/SEED/logs/long_vs_short_caption/lightning_logs/version_4_short_caption/checkpoints/epoch=9-step=39000.ckpt
+# weight_path: /home/zheedong/Projects/SEED/logs/long_vs_short_caption/lightning_logs/version_5_long_caption/checkpoints/epoch=9-step=39000.ckpt
+weight_path: /home/zheedong/Projects/SEED/logs/long_short_mixed/lightning_logs/version_0/checkpoints/last.ckpt
 eval: False
 
 dist:
-  n_gpus: 4
+  n_gpus: 1
   n_nodes: 1
 
 dataset:
   val_config:
     use_coco_val: True
+
+    dataset_configs: ['configs/data/laion_capsfusion_val.yaml']
+    weights: [1]
+    shardshuffle: 100
+    resampled: True
+    world_size: 1
+    one_epoch_data_size: 5000
+
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
     root_dir: /ssd0/data/coco/images/val2014
     start_index: 0
-    end_index: 256
+    end_index: 5000
+
   num_workers: 16
   shuffle: True
-  text_max_length: 128
+  text_max_length: 512
 
 stage1:
   init: 'SEED'
@@ -33,14 +44,19 @@ stage1:
 stage2:
   bypass_codebook: False
   load_diffusion: True
+  vq:
+    type: 'vq2' # ['vq2', 'ema_vq', nsvq']
+    replace_codes: True
+    replacement_num_batches: 1000
+    discarding_threshold: 0.01
 
 experiment:
   seed: 0
   stage: 2
-  local_batch_size: 1024
-  val_batch_size: 16
+  local_batch_size: 1
+  val_batch_size: 512
   test_split: train
-  max_epochs: 1
+  max_epochs: 40
   deterministic: False
   grad_accumulation: 1
   check_val_every_n_epoch: 1
@@ -52,7 +68,7 @@ experiment:
 
 optimizer:
   vit_precision: 'fp16'
-  diffusion_precision: 'fp32'
+  diffusion_precision: 'fp16'
   precision: 'bf16'
   max_lr: 7e-4
 

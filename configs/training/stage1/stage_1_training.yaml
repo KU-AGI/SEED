@@ -25,6 +25,7 @@ dataset:
     world_size: 1
     one_epoch_data_size: 1000000
   val_config:
+    use_coco_val: True
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
     root_dir: /ssd0/data/coco/images/val2014
     start_index: 0
@@ -39,6 +40,11 @@ stage1:
 stage2:
   bypass_codebook: False
   load_diffusion: False
+  vq:
+    type: 'vq2' # ['vq2', 'ema_vq', nsvq']
+    replace_codes: True
+    replacement_num_batches: 1000
+    discarding_threshold: 0.1
 
 experiment:
   seed: 0

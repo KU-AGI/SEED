@@ -2,14 +2,14 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/precision_test
+result_file_path: ./logs/capsfusion_dci_llava_long_caption_last_token
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
 
-resume: False
+resume: True
 load_weight: False
-weight_path: None
+weight_path: /home/zheedong/Projects/SEED/logs/capsfusion_dci_llava_long_caption_last_token/lightning_logs/version_14/checkpoints/last.ckpt
 eval: False
 
 dist:
@@ -17,6 +17,13 @@ dist:
   n_nodes: 1
 
 dataset:
+  train_config:
+    dataset_configs: ['configs/data/laion_capsfusion.yaml', 'configs/data/dci_llava.yaml', 'configs/data/coco_karpathy_train.yaml']
+    weights: [1000, 1, 1]
+    shardshuffle: 100
+    resampled: True
+    world_size: 1
+    one_epoch_data_size: 1000000
   val_config:
     use_coco_val: True
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
@@ -25,13 +32,13 @@ dataset:
     end_index: 256
   num_workers: 16
   shuffle: True
-  text_max_length: 128
+  text_max_length: 512
 
 stage1:
   init: 'SEED'
 
 stage2:
-  bypass_codebook: False
+  bypass_codebook: True
   load_diffusion: True
 
 experiment:
@@ -40,9 +47,10 @@ experiment:
   local_batch_size: 1024
   val_batch_size: 16
   test_split: train
-  max_epochs: 1
+  max_epochs: 40
   deterministic: False
   grad_accumulation: 1
+  # val_check_interval: 0.2
   check_val_every_n_epoch: 1
   enable_checkpointing: True
   log_every_n_steps: 1
@@ -52,7 +60,7 @@ experiment:
 
 optimizer:
   vit_precision: 'fp16'
-  diffusion_precision: 'fp32'
+  diffusion_precision: 'fp16'
   precision: 'bf16'
   max_lr: 7e-4
 

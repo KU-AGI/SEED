@@ -14,72 +14,12 @@ from torch.nn import functional as F
 import numpy as np
 from functools import partial
 from einops import rearrange
+import torch.distributions.normal as normal_dist
+import torch.distributions.uniform as uniform_dist
 
 from .blip2 import Blip2Base, disabled_train
 from .vit import Block
 from .utils import download_cached_file, is_url
-from typing import Tuple
-import pdb
-
-import torch.distributions.normal as normal_dist
-import torch.distributions.uniform as uniform_dist
-
-class EMAVectorQuantizer(nn.Module):
-    """
-    EMAVectorQuantizer
-    """
-    def __init__(self,
-                 dim: int,
-                 n_embed: int,
-                 beta: float,
-                 decay: float = 0.99,
-                 eps: float = 1e-5) -> None:
-        super().__init__()
-        self.n_embed = n_embed
-        self.dim = dim
-        self.beta = beta
-        self.decay = decay
-        self.eps = eps
-
-        embedding = torch.randn(n_embed, dim)
-        self.register_buffer("embedding", embedding)
-        self.register_buffer("cluster_size", torch.zeros(self.n_embed))
-        self.register_buffer("embedding_avg", embedding.clone())
-
-    def forward(self,
-                z: torch.FloatTensor) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.LongTensor]:
-        z = rearrange(z, 'b c h w -> b h w c').contiguous()  # [B,C,H,W] -> [B,H,W,C]
-        z_flattened = z.view(-1, self.dim)
-
-        d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
-            torch.sum(self.embedding**2, dim=1) - 2 * \
-            torch.einsum('bd,dn->bn', z_flattened, rearrange(self.embedding, 'n d -> d n'))
-
-        min_encoding_indices = torch.argmin(d, dim=1)
-        z_q = F.embedding(min_encoding_indices, self.embedding).view(z.shape)
-        embed_onehot = F.one_hot(min_encoding_indices, self.n_embed).type(z_flattened.dtype)
-
-        if self.training:
-            embed_onehot_sum = embed_onehot.sum(0)
-            embed_sum = embed_onehot.transpose(0, 1) @ z_flattened
-
-            dist_fn.all_reduce(embed_onehot_sum, op=dist_fn.ReduceOp.SUM)
-            dist_fn.all_reduce(embed_sum, op=dist_fn.ReduceOp.SUM)
-
-            self.cluster_size.data.mul_(self.decay).add_(embed_onehot_sum, alpha=1 - self.decay)
-            self.embedding_avg.data.mul_(self.decay).add_(embed_sum, alpha=1 - self.decay)
-
-            n = self.cluster_size.sum()
-            cluster_size = (self.cluster_size + self.eps) / (n + self.n_embed * self.eps) * n
-            embed_normalized = self.embedding_avg / cluster_size.unsqueeze(1)
-
-            self.embedding.data.copy_(embed_normalized)
-
-        diff = self.beta * torch.mean((z_q.detach() - z) ** 2)
-        z_q = z + (z_q - z).detach()
-        z_q = rearrange(z_q, 'b h w c -> b c h w').contiguous()
-
-        return z_q, diff, min_encoding_indices
 
 class VectorQuantizer2(nn.Module):
     """
@@ -91,7 +31,8 @@ class VectorQuantizer2(nn.Module):
     # backwards compatibility we use the buggy version by default, but you can
     # specify legacy=False to fix it.
     def __init__(self, n_e, e_dim, beta, remap=None, unknown_index="random", sane_index_shape=False, legacy=True,
-                 device=torch.device('cpu'), discarding_threshold=0.01):
+                 discarding_threshold=0.01):
+                #  discarding_threshold=0.01):
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
@@ -116,9 +57,10 @@ class VectorQuantizer2(nn.Module):
 
         self.sane_index_shape = sane_index_shape
 
-        self.codebooks_used = torch.zeros(self.n_e, dtype=torch.int32, device=device)
+        # self.codebooks_used = torch.zeros(self.n_e, dtype=torch.int32).to(device)
+        self.codebooks_used = torch.zeros(self.n_e, dtype=torch.int32)
 
-        self.device = device
+        # self.device = device
         self.discarding_threshold = discarding_threshold
         self.eps = 1e-12
 
@@ -188,6 +130,7 @@ class VectorQuantizer2(nn.Module):
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-12)))
 
         with torch.no_grad():
+            self.codebooks_used = self.codebooks_used.to(z_flattened.device)
             self.codebooks_used[min_encoding_indices] += 1
 
         if self.remap is not None:
@@ -253,9 +196,10 @@ class VectorQuantizer2(nn.Module):
             unused_count = unused_indices.shape[0]
             used_count = used_indices.shape[0]
 
+            device = self.embedding.weight.device
             if used_count == 0:
                 print(f'####### used_indices equals zero / shuffling whole codebooks ######')
-                self.embedding.weight += self.eps * torch.randn(self.embedding.weight.size(), device=self.device).clone()
+                self.embedding.weight += self.eps * torch.randn(self.embedding.weight.size(), device=device).clone()
             else:
                 used = self.embedding.weight[used_indices].clone()
                 if used_count < unused_count:
@@ -266,7 +210,7 @@ class VectorQuantizer2(nn.Module):
 
                 self.embedding.weight[unused_indices] *= 0
                 self.embedding.weight[unused_indices] += used_codebooks[range(unused_count)] + self.eps * torch.randn(
-                    (unused_count, self.e_dim), device=self.device).clone()
+                    (unused_count, self.e_dim), device=device).clone()
 
             print(f'************* Replaced ' + str(unused_count) + f' codebooks *************')
             self.codebooks_used[:] = 0.0
@@ -277,7 +221,8 @@ class VectorQuantizer2(nn.Module):
 
 
 class NSVQ(VectorQuantizer2):
-    def __init__(self, n_e, e_dim, beta, remap=None, unknown_index="random", sane_index_shape=False, legacy=True, device=torch.device('cpu'), discarding_threshold=0.01, initialization='normal'):
+    # def __init__(self, n_e, e_dim, beta, remap=None, unknown_index="random", sane_index_shape=False, legacy=True, device=torch.device('cpu'), discarding_threshold=0.01, initialization='normal'):
+    def __init__(self, n_e, e_dim, beta, remap=None, unknown_index="random", sane_index_shape=False, legacy=True, discarding_threshold=0.01, initialization='normal'):
         super().__init__(
             n_e=n_e, e_dim=e_dim, beta=beta, remap=remap, unknown_index=unknown_index, sane_index_shape=sane_index_shape, legacy=legacy,
         )
@@ -297,21 +242,24 @@ class NSVQ(VectorQuantizer2):
                 5. initialization = Initial distribution for codebooks
 
                 """
-        self.device = device
+        # self.device = device
         self.discarding_threshold = discarding_threshold
         self.eps = 1e-12
 
         if initialization == 'normal':
-            codebooks = torch.randn(self.n_e, self.e_dim, device=device)
+            # codebooks = torch.randn(self.n_e, self.e_dim, device=device)
+            codebooks = torch.randn(self.n_e, self.e_dim)
         elif initialization == 'uniform':
             codebooks = uniform_dist.Uniform(-1 / self.n_e, 1 / self.n_e).sample([self.n_e, self.e_dim])
         else:
             raise ValueError("initialization should be one of the 'normal' and 'uniform' strings")
 
-        self.codebooks = torch.nn.Parameter(codebooks, requires_grad=True).to(device)
+        # self.codebooks = torch.nn.Parameter(codebooks, requires_grad=True).to(device)
+        self.codebooks = torch.nn.Parameter(codebooks, requires_grad=True)
 
         # Counter variable which contains the number of times each codebook is used
-        self.codebooks_used = torch.zeros(self.n_e, dtype=torch.int32, device=device)
+        # self.codebooks_used = torch.zeros(self.n_e, dtype=torch.int32, device=device)
+        self.codebooks_used = torch.zeros(self.n_e, dtype=torch.int32)
 
     def forward(self, input_data):
 
@@ -330,15 +278,17 @@ class NSVQ(VectorQuantizer2):
         """
         bz = input_data.shape[0]
         input_data = input_data.view(-1, self.e_dim)
+        device = input_data.device
         # compute the distances between input and codebooks vectors
         distances = (torch.sum(input_data ** 2, dim=1, keepdim=True)
                      - 2 * (torch.matmul(input_data, self.codebooks.t()))
-                     + torch.sum(self.codebooks.t() ** 2, dim=0, keepdim=True))
+                     + torch.sum(self.codebooks.t() ** 2, dim=0, keepdim=True)).to(device)
 
-        min_indices = torch.argmin(distances, dim=1)
+        # min_indices = torch.argmin(distances, dim=1)
+        min_indices = torch.argmin(distances, dim=1).to(device)
 
         hard_quantized_input = self.codebooks[min_indices]
-        random_vector = normal_dist.Normal(0, 1).sample(input_data.shape).to(self.device)
+        random_vector = normal_dist.Normal(0, 1).sample(input_data.shape).to(device)
 
         norm_quantization_residual = (input_data - hard_quantized_input).square().sum(dim=1, keepdim=True).sqrt()
         norm_random_vector = random_vector.square().sum(dim=1, keepdim=True).sqrt()
@@ -358,6 +308,7 @@ class NSVQ(VectorQuantizer2):
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + self.eps)))
 
         with torch.no_grad():
+            self.codebooks_used = self.codebooks_used.to(device)
             self.codebooks_used[min_indices] += 1
 
         # use the first returned tensor "quantized_input" for training phase (Notice that you do not have to use the
@@ -407,9 +358,10 @@ class NSVQ(VectorQuantizer2):
             unused_count = unused_indices.shape[0]
             used_count = used_indices.shape[0]
 
+            device = self.codebooks.device
             if used_count == 0:
                 print(f'####### used_indices equals zero / shuffling whole codebooks ######')
-                self.codebooks += self.eps * torch.randn(self.codebooks.size(), device=self.device).clone()
+                self.codebooks += self.eps * torch.randn(self.codebooks.size(), device=device).clone()
             else:
                 used = self.codebooks[used_indices].clone()
                 if used_count < unused_count:
@@ -420,7 +372,7 @@ class NSVQ(VectorQuantizer2):
 
                 self.codebooks[unused_indices] *= 0
                 self.codebooks[unused_indices] += used_codebooks[range(unused_count)] + self.eps * torch.randn(
-                    (unused_count, self.e_dim), device=self.device).clone()
+                    (unused_count, self.e_dim), device=device).clone()
 
             print(f'************* Replaced ' + str(unused_count) + f' codebooks *************')
             self.codebooks_used[:] = 0.0
@@ -466,7 +418,10 @@ class Blip2QformerQuantizer(Blip2Base):
                  use_recon_s_for_image=False,
                  use_qformer_image=False,
                  image_features_dim=1024,
-                 is_train=True,):
+                 device="cuda",
+                 is_train=True,
+                 legacy=False,
+                 ):
         super().__init__()
 
         self.tokenizer = self.init_tokenizer()
@@ -515,15 +470,16 @@ class Blip2QformerQuantizer(Blip2Base):
         self.query_tokens.requires_grad = is_train
 
         if vq_type == "vq2":
-            self.quantize = VectorQuantizer2(n_embed, codebook_embed_dim, beta=0.25, remap=None, sane_index_shape=False, legacy=False,
-                                             device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            self.quantize = VectorQuantizer2(n_embed, codebook_embed_dim, beta=0.25, remap=None, sane_index_shape=False, legacy=legacy,
+                                            #  device=device,
                                              discarding_threshold=discarding_thre,
                                             )
         elif vq_type == "ema_vq":
             self.quantize = EMAVectorQuantizer(codebook_embed_dim, n_embed, beta=0.25)
         elif vq_type == "nsvq":
             self.quantize = NSVQ(n_embed, codebook_embed_dim, beta=0.25, remap=None, sane_index_shape=False,
-                                 legacy=False, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+                                #  legacy=False, device=device,
+                                 legacy=legacy,
                                  discarding_threshold=discarding_thre, initialization='uniform')
         else:
             raise NotImplementedError
@@ -687,8 +643,7 @@ class Blip2QformerQuantizer(Blip2Base):
         for blk in self.blocks_image:
             query_output_up_pos_image = blk(query_output_up_pos_image)
         # Still [b, 32, 768]
-        query_output_up = query_output_up_pos_image
-        return query_output_up
+        return query_output_up_pos_image
 
     def add_positional_embedding(self, query_output_up):
         pos_embed_image = self.pos_embed_image.repeat(query_output_up.shape[0], 1, 1)

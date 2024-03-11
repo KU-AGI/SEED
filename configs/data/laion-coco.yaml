@@ -1,4 +1,4 @@
 META:
-  - ["/ssd0/data/laion-coco-final/{00000..66302}.tar", 10000000]
+  - ["/ssd0/data/laion-coco-final/{00000..66302}.tar", 23700000]
 
 MAX_WORDS: 128

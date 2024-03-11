@@ -2,7 +2,7 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/precision_test
+result_file_path: ./logs/noexp
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
@@ -13,17 +13,23 @@ weight_path: None
 eval: False
 
 dist:
-  n_gpus: 4
+  n_gpus: 1
   n_nodes: 1
 
 dataset:
+  train_config:
+    dataset_configs: ['configs/data/laion_capsfusion_sc.yaml', 'configs/data/laion_coco_sc.yaml']
+    weights: [1, 1]
+    shardshuffle: 100
+    resampled: True
+    world_size: 1
+    one_epoch_data_size: 1000000
   val_config:
-    use_coco_val: True
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
     root_dir: /ssd0/data/coco/images/val2014
     start_index: 0
-    end_index: 256
-  num_workers: 16
+    end_index: -1
+  num_workers: 1
   shuffle: True
   text_max_length: 128
 
@@ -31,30 +37,41 @@ stage1:
   init: 'SEED'
 
 stage2:
-  bypass_codebook: False
-  load_diffusion: True
+  bypass_codebook: True
+  load_diffusion: False
+  train_unet: False
 
 experiment:
   seed: 0
-  stage: 2
-  local_batch_size: 1024
-  val_batch_size: 16
+  stage: 1
+  local_batch_size: 8
+  val_batch_size: 256
   test_split: train
-  max_epochs: 1
+  max_epochs: 40
   deterministic: False
   grad_accumulation: 1
   check_val_every_n_epoch: 1
+  val_check_interval: 2
   enable_checkpointing: True
   log_every_n_steps: 1
-  num_sanity_val_steps: 1
+  num_sanity_val_steps: 0
   num_warmup_steps: 200
-  grad_clip_val: 0.5
+  recon_loss_weight: 1.0
+  sds_loss_weight: 0
+  clip_loss_weight: 1.0
+  use_sds_loss_schedule: True
+  cross_annealing: True
+  num_positive_samples: 3
+  min_pos_weight: 0.1
+  label_smoothing: 0.01
+  max_token_length: 256
 
 optimizer:
   vit_precision: 'fp16'
   diffusion_precision: 'fp32'
   precision: 'bf16'
   max_lr: 7e-4
+  grad_clip_val: 0.5
 
 hyperparameters:
   beta_1: 0.9

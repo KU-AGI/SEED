@@ -34,7 +34,7 @@ class CocoDataset(Dataset):
             self.karpathy = json.load(f)
         
         self.start_index = start_index
-        self.end_index = None if end_index == "None" else end_index
+        self.end_index = end_index
 
     def __len__(self):
         if self.start_index is not None and self.end_index is not None:
