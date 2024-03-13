@@ -1,4 +1,4 @@
-# Overfitting Config
+# Training Config
 ## Conda env
 ```bash
 conda env create -f seed.yaml
@@ -6,7 +6,7 @@ conda env create -f seed.yaml
 
 ## SEED Tokenizer Training
 ```bash
-CUDA_VISIBLE_DEVICES=0 python train_v7_unified.py cfg_path=configs/seed_unified_test.yaml
+CUDA_VISIBLE_DEVICES=0 python train_v7_unified.py cfg_path=configs/training/stage<1,2>/<config>.yaml
 ``` 
 
 # Original README
