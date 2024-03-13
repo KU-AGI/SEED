@@ -1123,7 +1123,6 @@ if __name__ == "__main__":
     if cfg.load_weight and cfg.resume:
         raise ValueError("Only checkpoint or finetune")
 
-
     if cfg.load_weight:
         wrapper = SEEDTrainingWrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg, strict=False).to(device)
         print("Loaded model from checkpoint")
