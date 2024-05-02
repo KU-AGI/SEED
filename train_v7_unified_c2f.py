@@ -425,10 +425,16 @@ class SEEDTrainingWrapper(LightningModule):
         return query_output
 
     def get_stage1_loss_c2f(self, batch, batch_idx: int):
-        image, pos_ids, text_tokens, text_attention_masks, captions = batch
+        if len(batch) == 4:
+            image, pos_ids, text_tokens, text_attention_masks = batch
+        else:
+            image, pos_ids, text_tokens, text_attention_masks, captions = batch
         b = image.shape[0]
 
+        # [b, 32, 768]
         query_output = self.get_qformer_tokens(image)
+        # Choose the token with the same index as pos_ids
+        # [b, 2, 768]
         image_feats = torch.stack([query_output.last_hidden_state[i].index_select(0, pos_ids[i]) for i in range(b)])
         image_feats = F.normalize(image_feats, dim=-1)
 
@@ -443,6 +449,7 @@ class SEEDTrainingWrapper(LightningModule):
         # CLS token
         # [batch_size * num_positive_samples, embed_dim]
         text_feats = F.normalize(text_output.last_hidden_state[:, 0, :], dim=-1)
+        # [batch_size, num_positive_samples, embed_dim]
         text_feats = rearrange(text_feats, "(bs n) d -> bs n d", bs=b).contiguous()
 
         ###============== Image-text Contrastive ===================###
@@ -462,22 +469,41 @@ class SEEDTrainingWrapper(LightningModule):
         sim_t2i = torch.matmul(mat_text, mat_image_all).squeeze(-1) / self.temp
         sim_t2i = rearrange(sim_t2i, "bs1 bs2 n1 n2 -> bs1 (bs2 n1) n2", bs1=b)
 
+        # c2f_schedule is [1, 0.97, ..., 0.129, 0.1]
         c2f_schedule = self.c2f_schedule.repeat(b, 1).to(self.device)
         with torch.no_grad():
+            # Set for batch, where is the positive sample
+            # 1 means positive, 0 means negative
+            # [b, num_positive_samples, b]
             pos_or_neg = torch.eye(b, device=self.device).unsqueeze(1).repeat(1, num_positive_samples, 1)
             labels = []
             weights = []
             for i in range(num_positive_samples):
+                # Positivie sample in 
                 target_pos_idx = torch.LongTensor([[i]] * b).to(self.device)
+                # Get the ids of the positive samples (Random choice between 0 ~ 31)
+                # pos_ids : [b, num_positive_samples]
+                # target_pos_ids : [b, 1] (Choose ith of pos_ids)
                 target_pos_ids = pos_ids.gather(1, target_pos_idx)
+                # difference between pos_ids and target_pos_ids
                 abs_diff = torch.abs(pos_ids - target_pos_ids)
+                # Get the schedule for the difference
                 schedule = c2f_schedule.gather(1, abs_diff)
+                # Make the schedule to be normalized
+                # [b, num_positive_samples]
                 schedule = schedule / schedule.sum(-1, keepdim=True)
+                # weight : [b, num_positive_samples, b] 
+                # Hadamard product between pos_or_neg and schedule
+                # pos_or_neg is diagonal matrix, so each component of schedule is multiplied by the corresponding diagonal element
                 weight = pos_or_neg * schedule.unsqueeze(-1)
+                # weight.split(1) : list of [num_positive_sample, b] (len : b)
+                # torch.cat(weight.split(1), dim=1) : [num_positive_samples * b, b]
+                # weight : [b, num_positive_samples * b]
                 weight = torch.cat(weight.split(1), dim=1).squeeze().T
                 weights.append(weight)
                 label = torch.cat(pos_or_neg.split(1), dim=1).squeeze().T
                 labels.append(label)
+            # [b, num_positive_sample * b, num_positive_sample]
             local_labels = torch.stack(labels, dim=-1)
             local_weigths = torch.stack(weights, dim=-1)
             all_labels = []

@@ -130,6 +130,8 @@ class SEEDTrainingWrapper(LightningModule):
         self.max_step = int(self.num_train_timesteps * t_range[1])
         # self.alphas = self.image_noising_scheduler.alphas_cumprod  # for convenience
 
+        self.generator = torch.Generator().manual_seed(self.cfg.experiment.seed)
+
     def setup(self, stage):
         # Setup training parameter
         self.image_tokenizer.model.train()
@@ -153,6 +155,15 @@ class SEEDTrainingWrapper(LightningModule):
             # In this case, unet is frozen
             for param in self.image_tokenizer.diffusion_model.unet.parameters():
                 param.requires_grad = False
+            if self.cfg.stage2.unfreeze_cross_attn:
+                for name, module in self.unet.named_modules():
+                # The blocks of interest are those that contain cross-attention mechanisms.
+                    if 'attentions' in name:
+                        print(f"Unfreezing layers in module: {name}")
+                        # Unfreeze parameters in these specific blocks
+                        for param in module.parameters():
+                            param.requires_grad = True
+                
             for param in self.image_tokenizer.diffusion_model.vae.parameters():
                 param.requires_grad = False
 
@@ -1211,14 +1222,14 @@ class SEEDTrainingWrapper(LightningModule):
                     prompt_embeds=encoder_hidden_state[0],
                     guidance_scale=2.0,
                     num_inference_steps=150,
-                    generator=torch.Generator().manual_seed(self.cfg.experiment.seed),
+                    generator=self.generator,
                 )
 
                 gt_images = self.pipeline(
                     prompt_embeds=encoder_hidden_state[1],
                     guidance_scale=2.0,
                     num_inference_steps=150,
-                    generator=torch.Generator().manual_seed(self.cfg.experiment.seed),
+                    generator=self.generator,
                 )
                 
             save_path = f"{tb_log_dir}/images/version_{self.logger.version}/epoch_{self.current_epoch}/images"

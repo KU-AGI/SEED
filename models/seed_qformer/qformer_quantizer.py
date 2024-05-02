@@ -379,6 +379,14 @@ class NSVQ(VectorQuantizer2):
 
         return unused_count
 
+    def get_codebook_entry(self, indices, shape=None):
+        codebooks = self.codebooks.detach().clone()
+        ###########################################
+        quantized_input = codebooks[indices]
+
+        #use the tensor "quantized_input" as vector quantized version of your input data for inference (evaluation) phase.
+        return quantized_input
+
 class Blip2QformerQuantizer(Blip2Base):
     """
     BLIP2 first-stage model with Q-former and ViT.
@@ -586,7 +594,7 @@ class Blip2QformerQuantizer(Blip2Base):
         query_output_down = self.encode_task_layer(causal_embeddings)
 
         # quant [b, 32, 32], loss_embed [b, 32, 768], embed_ind [b, 32]
-        quant, loss_embed, embed_ind = self.quantize(query_output_down)
+        quant, loss_embed, embed_ind, _ = self.quantize(query_output_down)
         # 
         embed_ind = embed_ind.reshape(quant.shape[0], -1)
         # quant embedding dimension is [b, 32, 32]

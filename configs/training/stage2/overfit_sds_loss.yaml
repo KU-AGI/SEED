@@ -2,24 +2,29 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/noexp
+result_file_path: ./logs/dreamllm_overfit
+# result_file_path: ./logs/dreamllm_overfit_debug
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
-  diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
+  # diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
+  diffusion_model_path: stabilityai/stable-diffusion-2-1-base
 
 resume: False
 load_weight: False
-weight_path: None
+weight_path: 
+# weight_path: logs/dreamllm_overfit/lightning_logs/version_18/checkpoints/epoch=19999-step=80000.ckpt
 eval: False
 
 dist:
-  n_gpus: 2
+  n_gpus: 1
   n_nodes: 1
 
 dataset:
   train_config:
-    dataset_configs: ['configs/data/laion_capsfusion_sc.yaml', 'configs/data/laion_coco_sc.yaml']
-    weights: [1, 1]
+    # dataset_configs: ['configs/data/cc15m.yaml', 'configs/data/laion-coco.yaml', 'configs/data/mscoco.yaml']
+    dataset_configs: ['configs/data/cc15m.yaml']
+    # weights: [1, 8, 1]
+    weights: [1]
     shardshuffle: 100
     resampled: True
     world_size: 1
@@ -28,8 +33,8 @@ dataset:
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
     root_dir: /ssd0/data/coco/images/val2014
     start_index: 0
-    end_index: -1
-  num_workers: 1
+    end_index: 8
+  num_workers: 4
   shuffle: True
   text_max_length: 128
 
@@ -38,43 +43,42 @@ stage1:
 
 stage2:
   bypass_codebook: True
-  load_diffusion: False
+  load_diffusion: True
   train_unet: False
+  unfreeze_cross_attn: False
+  loss_weight:
+    loss_codebook: 0.0
+    loss_recon: 0.0
+    loss_sds: 1.0
 
 experiment:
   seed: 0
-  stage: 1
+  stage: 2
   local_batch_size: 8
-  val_batch_size: 256
+  val_batch_size: 8
   test_split: train
-  max_epochs: 40
-  deterministic: False
+  max_epochs: 5000
+  deterministic: True
   grad_accumulation: 1
-  check_val_every_n_epoch: 1
-  val_check_interval: 2
+  check_val_every_n_epoch: 100
+  # overfit_batches: 16
+  # val_check_interval: 400
   enable_checkpointing: True
+  # enable_checkpointing: False
   log_every_n_steps: 1
-  num_sanity_val_steps: 0
-  num_warmup_steps: 200
-  recon_loss_weight: 1.0
-  sds_loss_weight: 0
-  clip_loss_weight: 1.0
-  use_sds_loss_schedule: True
-  cross_annealing: True
-  num_positive_samples: 3
-  min_pos_weight: 0.1
-  label_smoothing: 0.01
-  max_token_length: 256
+  num_sanity_val_steps: 2
+  num_warmup_steps: 0
 
 optimizer:
   vit_precision: 'fp16'
   diffusion_precision: 'fp32'
   precision: 'bf16'
-  max_lr: 7e-4
+  max_lr: 1e-4
   grad_clip_val: 0.5
 
 hyperparameters:
   beta_1: 0.9
   beta_2: 0.999
-  weight_decay: 1e-8
+  # weight_decay: 1e-8
+  weight_decay: 5e-2
 

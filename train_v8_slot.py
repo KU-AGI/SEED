@@ -36,6 +36,7 @@ import matplotlib.pyplot as plt
 
 from models.seed_qformer.vit import Block
 from models.seed_llama_tokenizer import ImageTokenizer
+from models.slot_attn import MultiHeadSTEVESA
 
 from datamodules.seed_llama_datamodule import SEEDDataModule
 
@@ -101,8 +102,6 @@ class SEEDTrainingWrapper(LightningModule):
 
         self.B = None
 
-        self.transform_224 = transforms.Resize((224, 224), antialias=True)
-
         # For diffusion DDP
         if self.image_tokenizer.diffusion_model is not None:
             self.feature_extractor = self.image_tokenizer.diffusion_model.feature_extractor
@@ -127,6 +126,29 @@ class SEEDTrainingWrapper(LightningModule):
             self.recon_s = cfg.stage2.recon_s
         else:
             self.recon_s = False
+
+        self.transform_224 = transforms.Resize((224, 224), antialias=True)
+
+        # For slot attention
+        pretrain_backbone = True
+        dinov2 = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+        class DINOBackbone(torch.nn.Module):
+            def __init__(self, dinov2):
+                super().__init__()
+                self.dinov2 = dinov2
+
+            def forward(self, x):
+                enc_out = self.dinov2.forward_features(x)
+                return rearrange(
+                    enc_out["x_norm_patchtokens"], 
+                    "b (h w ) c -> b c h w",
+                    h=int(np.sqrt(enc_out["x_norm_patchtokens"].shape[-2]))
+                )
+        self.backbone = DINOBackbone(dinov2)
+        self.slot_attn = MultiHeadSTEVESA.from_pretrained(
+            self.cfg.checkpoint_path.slot_model_path, subfolder="MultiHeadSTEVESA".lower())
+
+        self.out_linear = nn.Linear(1024, 768)
 
     def setup(self, stage):
         # Setup training parameter
@@ -193,6 +215,10 @@ class SEEDTrainingWrapper(LightningModule):
             for name, param in self.image_tokenizer.model.Qformer.named_parameters():
                 param.requires_grad = False
             self.image_tokenizer.model.query_tokens.requires_grad = False
+
+            print("Freeze slot")
+            for param in self.slot_attn.parameters():
+                param.requires_grad = False
 
             # Random initialize stage 2 model weights
             if self.cfg.stage1.init == "trained":
@@ -265,10 +291,14 @@ class SEEDTrainingWrapper(LightningModule):
         Returns:
             float: clip image embedding [b, 1024]
         """        
+        if batch_img.size(-1) != 224:
+            batch_img = self.transform_224(batch_img)
         return self.image_encoder(batch_img).image_embeds.to(self.device)
 
     def get_causal_embeddings(self, image):
-        return self.image_tokenizer.model.get_causal_embeddings(image)
+        feat = self.backbone(image)
+        slots, attns = self.slot_attn(feat[:, None])
+        return slots.squeeze()
 
     def logging_train_stage2(self, generation_embedding_cosine_similarity, loss_dict, is_val=False):
         stage = "val" if is_val else "train"

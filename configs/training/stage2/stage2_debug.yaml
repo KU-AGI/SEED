@@ -2,7 +2,7 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/debug
+result_file_path: ./logs/sds_coco2
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
@@ -10,11 +10,10 @@ checkpoint_path:
 resume: False
 load_weight: False
 weight_path: None
-# weight_path: /home/ubuntu/Projects/SEED_Tokenizer/logs/current_training/nsvq_with_codebook_replacement/checkpoints/epoch=0-step=2000.ckpt
 eval: False
 
 dist:
-  n_gpus: 2
+  n_gpus: 1
   n_nodes: 1
 
 dataset:
@@ -26,12 +25,11 @@ dataset:
     world_size: 1
     one_epoch_data_size: 1000000
   val_config:
-    use_coco_val: True
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
     root_dir: /ssd0/data/coco/images/val2014
     start_index: 0
     end_index: 256
-  num_workers: 16
+  num_workers: 4
   shuffle: True
   text_max_length: 128
 
@@ -39,13 +37,9 @@ stage1:
   init: 'SEED'
 
 stage2:
-  bypass_codebook: False
+  bypass_codebook: True
   load_diffusion: True
-  vq:
-    type: 'vq2' # ['vq2', 'ema_vq', nsvq']
-    replace_codes: True
-    replacement_num_batches: 500
-    discarding_threshold: 0.1
+  train_unet: True
 
 experiment:
   seed: 0
@@ -55,20 +49,25 @@ experiment:
   test_split: train
   max_epochs: 40
   deterministic: False
-  grad_accumulation: 1
-  # check_val_every_n_epoch: 1
-  val_check_interval: 200
+  grad_accumulation: 8
+#  check_val_every_n_epoch: 1
+  val_check_interval: 400
   enable_checkpointing: True
   log_every_n_steps: 1
   num_sanity_val_steps: 1
   num_warmup_steps: 200
-  grad_clip_val: 0.5
+  recon_loss_weight: 1.0
+  sds_loss_weight: 0.1
+  clip_loss_weight: 1.0
+  use_sds_loss_schedule: True
+  cross_annealing: False
 
 optimizer:
   vit_precision: 'fp16'
-  diffusion_precision: 'fp16'
+  diffusion_precision: 'fp32'
   precision: 'bf16'
   max_lr: 7e-4
+  grad_clip_val: 0.5
 
 hyperparameters:
   beta_1: 0.9

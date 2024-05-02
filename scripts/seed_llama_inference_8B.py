@@ -58,7 +58,6 @@ def decode_image_text(generate_ids, tokenizer, save_path=None):
             print(texts)
             
         image_ids = (generate_ids[boi_index+1:eoi_index] - image_id_shift).reshape(1,-1)
-        pdb.set_trace()
         images = tokenizer.decode_image(image_ids)
 
         images[0].save(save_path)
@@ -108,7 +107,6 @@ decode_image_text(generate_ids, tokenizer)
 '''
 
 ### text-to-image generation
-import pdb; pdb.set_trace()
 prompt = "Can you generate an image of a dog on the green grass?"
 input_tokens = tokenizer.bos_token  + s_token + " " + prompt + sep + e_token
 generate_ids = generate(tokenizer, input_tokens, generation_config, model)

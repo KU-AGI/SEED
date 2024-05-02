@@ -2,8 +2,8 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/stage1_c2f
-#result_file_path: ./logs/noexp
+# result_file_path: ./logs/stage1_c2f
+result_file_path: ./logs_test/noexp
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
@@ -59,7 +59,7 @@ experiment:
 #  val_check_interval: 2
   enable_checkpointing: True
   log_every_n_steps: 1
-  num_sanity_val_steps: 1
+  num_sanity_val_steps: 0
   num_warmup_steps: 200
   recon_loss_weight: 1.0
   sds_loss_weight: 0

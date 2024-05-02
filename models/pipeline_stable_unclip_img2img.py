@@ -817,15 +817,17 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
 
         return ImagePipelineOutput(images=image)
 
-    @torch.autocast(device_type="cuda")
-    def train_diffusion(
+    @torch.no_grad()
+    @replace_example_docstring(EXAMPLE_DOC_STRING)
+    def my_call(
         self,
+        encoder_hidden_states: torch.FloatTensor,
         image: Union[torch.FloatTensor, PIL.Image.Image] = None,
         prompt: Union[str, List[str]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
-        num_training_steps: int = 1000,
-        guidance_scale: float = 1,
+        num_inference_steps: int = 20,
+        guidance_scale: float = 10,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
@@ -841,7 +843,6 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
         noise_level: int = 0,
         image_embeds: Optional[torch.FloatTensor] = None,
         negative_image_embeds: Optional[torch.FloatTensor] = None,
-        clean_image: Optional[torch.FloatTensor] = None,
     ):
         """
         The call function to the pipeline for generation.
@@ -912,54 +913,12 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
                 [`~ pipeline_utils.ImagePipelineOutput`] if `return_dict` is True, otherwise a `tuple`. When returning
                 a tuple, the first element is a list with the generated images.
         """
-        # image encoding components
-        # feature_extractor: CLIPImageProcessor
-        # image_encoder: CLIPVisionModelWithProjection
-
-        # # image noising components
-        # image_normalizer: StableUnCLIPImageNormalizer
-        # image_noising_scheduler: KarrasDiffusionSchedulers
-
-        # # regular denoising components
-        # tokenizer: CLIPTokenizer
-        # text_encoder: CLIPTextModel
-        # unet: UNet2DConditionModel
-        # scheduler: KarrasDiffusionSchedulers
-
-        # vae: AutoencoderKL
-        # for param in self.
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
-        if prompt is None and prompt_embeds is None:
-            # prompt = len(image) * [""] if isinstance(image, list) else ""
-            # Changed because we get image_embeds as input
-            prompt = image_embeds.shape[0] * [""] if isinstance(image_embeds, torch.Tensor) else ""
-
-        # 1. Check inputs. Raise error if not correct
-        self.check_inputs(
-            prompt=prompt,
-            image=image,
-            height=height,
-            width=width,
-            callback_steps=callback_steps,
-            noise_level=noise_level,
-            negative_prompt=negative_prompt,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            # Only image_embeds is not None, [b, 1024]
-            image_embeds=image_embeds,
-        )
-
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-
+        batch_size = encoder_hidden_states.shape[0]
         batch_size = batch_size * num_images_per_prompt
 
         device = self._execution_device
@@ -967,115 +926,73 @@ class StableUnCLIPImg2ImgPipeline(DiffusionPipeline, TextualInversionLoaderMixin
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
-        do_classifier_free_guidance = False
-
-        # 3. Encode input prompt
-        text_encoder_lora_scale = (cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None)
-       
-        # [b, 77, 1024] 
-        # Now img2img, prompt_embeds is None
-        prompt_embeds = self._encode_prompt(
-            prompt=prompt,
-            device=device,
-            num_images_per_prompt=num_images_per_prompt,
-            do_classifier_free_guidance=do_classifier_free_guidance,
-            negative_prompt=negative_prompt,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            lora_scale=text_encoder_lora_scale,
-        )
-
-        # 4. Encoder input image
-        # [b, 1024]
-        noise_level = torch.tensor([noise_level], device=device)
-        image_embeds = self._encode_image(
-            image=image,
-            device=device,
-            batch_size=batch_size,
-            num_images_per_prompt=num_images_per_prompt,
-            do_classifier_free_guidance=do_classifier_free_guidance,
-            noise_level=noise_level,
-            generator=generator,
-            image_embeds=image_embeds,
-            negative_image_embeds=negative_image_embeds,
-        )
+        do_classifier_free_guidance = guidance_scale > 1.0
 
         # 5. Prepare timesteps
-        # self.scheduler.set_timesteps(num_training_steps, device=device)
-        # # 21 length list
-        # timesteps = self.scheduler.timesteps
+
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        # 21 length list
+        timesteps = self.scheduler.timesteps
 
         # 6. Prepare latent variables
-        # num_channels_latents = self.unet.config.in_channels
+        num_channels_latents = self.unet.config.in_channels
         # Latent is [b, 4, 96, 96]
-        # latents = self.prepare_latents(
-        #     batch_size=batch_size,
-        #     num_channels_latents=num_channels_latents,
-        #     height=height,
-        #     width=width,
-        #     dtype=prompt_embeds.dtype,
-        #     device=device,
-        #     generator=generator,
-        #     latents=latents,
-        # )
-        # pdb.set_trace()
+        latents = self.prepare_latents(
+            batch_size=batch_size,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            dtype=encoder_hidden_states.dtype,
+            device=device,
+            generator=generator,
+            # latents=latents,
+        )
 
-        # Convert images to latent space
-        with torch.autocast(device_type="cuda"):
-            latents = self.vae.encode(clean_image).latent_dist.sample()
-        latents = latents * self.vae.config.scaling_factor
+        # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # Sample noise that we'll add to the latents
-        noise = torch.randn_like(latents)
-        # 5. Prepare timesteps
-        # self.scheduler.set_timesteps(bsz, device=device)
-        # 21 length list
-        # timesteps = self.scheduler.timesteps
-        timesteps = torch.randint(0, num_training_steps, (batch_size,), device=device)
-        timesteps = timesteps.long()
+        # 8. Denoising loop
+        for i, t in enumerate(self.progress_bar(timesteps)):
+            # latents = [b, 4, 96, 96]
+            # Because of classifier free guidance, we need to duplicate the latents
+            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+            # Now latents = [2 * b, 4, 96, 96]
 
-        # Add noise to the latents according to the noise magnitude at each timestep
-        # (this is the forward diffusion process)
-        noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
-        noisy_latents = torch.cat([noisy_latents] * 2) if do_classifier_free_guidance else noisy_latents
-
-        # Get the text embedding for conditioning
-        encoder_hidden_states = prompt_embeds
-        target = noise
-
-        # Predict the noise residual and compute loss
-        # model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
-        if do_classifier_free_guidance:
-            timesteps = torch.cat([timesteps] * 2)
-
-        # Make unet is trainable
-        self.unet.train()
-        model_pred = self.unet(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states=prompt_embeds,
-                class_labels=image_embeds,
+            # predict the noise residual
+            # [1, 4, 96, 96]
+            noise_pred = self.unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=encoder_hidden_states,
                 cross_attention_kwargs=cross_attention_kwargs,
                 return_dict=False,
             )[0]
 
-        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            # perform guidance
+            if do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-        return loss
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
-        # # 9. Post-processing
-        # if not output_type == "latent":
-        #     image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-        # else:
-        #     image = latents
+            if callback is not None and i % callback_steps == 0:
+                callback(i, t, latents)
 
-        # image = self.image_processor.postprocess(image, output_type=output_type)
+        # 9. Post-processing
+        if not output_type == "latent":
+            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+        else:
+            image = latents
 
-        # # Offload last model to CPU
-        # if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
-        #     self.final_offload_hook.offload()
+        image = self.image_processor.postprocess(image, output_type=output_type)
 
-        # if not return_dict:
-        #     return (image, )
+        # Offload last model to CPU
+        if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
+            self.final_offload_hook.offload()
 
-        # return ImagePipelineOutput(images=image)
+        if not return_dict:
+            return (image, )
+
+        return ImagePipelineOutput(images=image)

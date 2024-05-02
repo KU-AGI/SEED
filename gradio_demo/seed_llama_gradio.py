@@ -39,9 +39,9 @@ disable_btn = gr.Button.update(interactive=False)
 
 @dataclass
 class Arguments:
-    server_port: Optional[int] = field(default=7860, metadata={"help": "network port"})
+    server_port: Optional[int] = field(default=6069, metadata={"help": "network port"})
     server_name: Optional[str] = field(default='0.0.0.0', metadata={"help": "network address"})
-    request_address: Optional[str] = field(default='http://127.0.0.1:7890/generate', metadata={"help": "request address"})
+    request_address: Optional[str] = field(default='http://127.0.0.1:6069/generate', metadata={"help": "request address"})
     model_type: Optional[str] = field(default='seed-llama-14b', metadata={"help": "choice: [seed-llama-8b, seed-llama-14b]"})
 
 parser = transformers.HfArgumentParser(Arguments)
@@ -328,21 +328,26 @@ def load_demo(request: gr.Request):
     return dialog_state, input_state
 
 
+# title = ("""
+# # SEED-LLaMA
+# [[Project Page]](https://ailab-cvc.github.io/seed/seed_llama.html) [[Paper]](https://arxiv.org/pdf/2310.01218.pdf) [[Code]](https://github.com/AILab-CVC/SEED/tree/main)
+
+# ## Tips:
+# * Check out the conversation examples (at the bottom) for inspiration.
+
+# * You can adjust "Max History Rounds" to try a conversation with up to five rounds. For more turns, you can download our checkpoints from GitHub and deploy them locally for inference.
+
+# * Our demo supports a mix of images and texts as input. You can freely upload an image or enter text, and then click on "Add Image/Text". You can repeat the former step multiple times, and click on "Submit" for model inference at last.
+
+# * If you are not satisfied with the output, especially the generated image, you may click on "Regenerate" for another chance.
+
+# * You can click "Force Image Generation" to compel the model to produce images when necessary. For example, our model might struggle to generate images when there is an excessive amount of text-only context.
+# * SEED-LLaMA was trained with English-only data. It may process with other languages due to the inherent capabilities from LLaMA, but might not stable.
+# """)
+
 title = ("""
-# SEED-LLaMA
-[[Project Page]](https://ailab-cvc.github.io/seed/seed_llama.html) [[Paper]](https://arxiv.org/pdf/2310.01218.pdf) [[Code]](https://github.com/AILab-CVC/SEED/tree/main)
-
-## Tips:
-* Check out the conversation examples (at the bottom) for inspiration.
-
-* You can adjust "Max History Rounds" to try a conversation with up to five rounds. For more turns, you can download our checkpoints from GitHub and deploy them locally for inference.
-
-* Our demo supports a mix of images and texts as input. You can freely upload an image or enter text, and then click on "Add Image/Text". You can repeat the former step multiple times, and click on "Submit" for model inference at last.
-
-* If you are not satisfied with the output, especially the generated image, you may click on "Regenerate" for another chance.
-
-* You can click "Force Image Generation" to compel the model to produce images when necessary. For example, our model might struggle to generate images when there is an excessive amount of text-only context.
-* SEED-LLaMA was trained with English-only data. It may process with other languages due to the inherent capabilities from LLaMA, but might not stable.
+# MultiModal LLM
+This is a multimodal chat-bot that can generate text and images.
 """)
 
 css = """
@@ -391,24 +396,24 @@ img:after {
 
 if __name__ == '__main__':
 
-    examples_mix = [
-        ['images/cat.jpg', 'Add sunglasses to the animal.'],
-        ['images/eagle.jpg', 'Transform this image into cartoon style'],
-        [None, 'Generate an image of dog on green grass.'],
-        [None, 'Draw a painting of sunflowers in Van Gogh style.'],
-        ['images/dogs_4.jpg', 'How many dogs in the image?'],
-        ['images/spongebob.png', 'Who are they?'],
-        ['images/star.jpg', 'Do you know this painting?'],
-    ]
+    # examples_mix = [
+    #     ['images/cat.jpg', 'Add sunglasses to the animal.'],
+    #     ['images/eagle.jpg', 'Transform this image into cartoon style'],
+    #     [None, 'Generate an image of dog on green grass.'],
+    #     [None, 'Draw a painting of sunflowers in Van Gogh style.'],
+    #     ['images/dogs_4.jpg', 'How many dogs in the image?'],
+    #     ['images/spongebob.png', 'Who are they?'],
+    #     ['images/star.jpg', 'Do you know this painting?'],
+    # ]
     
-    examples_conv = [
-        ['images/demo_example1.jpg'],
-        ['images/demo_example2.jpg'],
-        ['images/demo_example3.jpg'],
-        ['images/demo_example7.jpg'],
-        ['images/demo_example5.jpg'],
-        ['images/demo_example6.jpg'],
-    ]
+    # examples_conv = [
+    #     ['images/demo_example1.jpg'],
+    #     ['images/demo_example2.jpg'],
+    #     ['images/demo_example3.jpg'],
+    #     ['images/demo_example7.jpg'],
+    #     ['images/demo_example5.jpg'],
+    #     ['images/demo_example6.jpg'],
+    # ]
     
     with gr.Blocks(css=css) as demo:
         gr.Markdown(title)
@@ -417,7 +422,7 @@ if __name__ == '__main__':
         with gr.Row():
             with gr.Column(scale=3):
                 with gr.Row():
-                    image = gr.Image(type='pil', label='input_image')
+                    image = gr.Image(type='pil', label='Input Image')
                 with gr.Row():
                     text = gr.Textbox(lines=5,
                                       show_label=False,
@@ -428,7 +433,7 @@ if __name__ == '__main__':
                     add_image_btn = gr.Button("Add Image")
                     add_text_btn = gr.Button("Add Text")
 
-                    submit_btn = gr.Button("Submit")
+                    submit_btn = gr.Button("Send Message")
 
                 with gr.Row():
                     num_beams = gr.Slider(minimum=1, maximum=4, value=1, step=1, interactive=True, label="Num of Beams")
@@ -449,33 +454,34 @@ if __name__ == '__main__':
                     force_img_gen = gr.Radio(choices=[True, False], value=False, label='Force Image Generation')
 
             with gr.Column(scale=7):
-                chatbot = gr.Chatbot(elem_id='chatbot', label="SEED LLaMA").style(height=700)
+                chatbot = gr.Chatbot(elem_id='chatbot', label="Conversation").style(height=700)
                 with gr.Row():
-                    upvote_btn = gr.Button(value="👍  Upvote", interactive=False)
-                    downvote_btn = gr.Button(value="👎  Downvote", interactive=False)
-                    regenerate_btn = gr.Button(value="🔄  Regenerate", interactive=False)
-                    clear_btn = gr.Button(value="🗑️  Clear history", interactive=False)
+                    # upvote_btn = gr.Button(value="👍  Upvote", interactive=False)
+                    # downvote_btn = gr.Button(value="👎  Downvote", interactive=False)
+                    regenerate_btn = gr.Button(value="Regenerate", interactive=False)
+                    clear_btn = gr.Button(value="Clear history", interactive=False)
 
         # with gr.Row():
         #     gr.Examples(examples=examples_image, label='Image examples', inputs=[image])
-        with gr.Row():
-            # with gr.Column(scale=6):
-            gr.Examples(examples=examples_mix, label='Input examples', inputs=[image, text])
-            # with gr.Column(scale=0.4):
-            #     gr.Examples(examples=examples_text, inputs=[text])
+        # with gr.Row():
+        #     # with gr.Column(scale=6):
+        #     gr.Examples(examples=examples_mix, label='Input examples', inputs=[image, text])
+        #     # with gr.Column(scale=0.4):
+        #     #     gr.Examples(examples=examples_text, inputs=[text])
             
         
-        # with gr.Row():
-        #     gr.Examples(examples=examples_2, inputs=[image])
+        # # with gr.Row():
+        # #     gr.Examples(examples=examples_2, inputs=[image])
         
-        with gr.Row():
-            # gr.Gallery(value=[Image.open(e[0]) for e in examples_conv], show_label=True, label="Example Conversations", elem_id="gallery",height=1400, object_fit='contain').style(grid=[3], height='auto')
-            gr.Gallery(value=[Image.open(e[0]) for e in examples_conv], show_label=True, label="Example Conversations", elem_id="gallery",height=1500, columns=[3], rows=[2])
+        # with gr.Row():
+        #     # gr.Gallery(value=[Image.open(e[0]) for e in examples_conv], show_label=True, label="Example Conversations", elem_id="gallery",height=1400, object_fit='contain').style(grid=[3], height='auto')
+        #     gr.Gallery(value=[Image.open(e[0]) for e in examples_conv], show_label=True, label="Example Conversations", elem_id="gallery",height=1500, columns=[3], rows=[2])
         
         # Register listeners
-        btn_list = [upvote_btn, downvote_btn, regenerate_btn, clear_btn]
-        upvote_btn.click(upvote_last_response, [dialog_state], [upvote_btn, downvote_btn])
-        downvote_btn.click(downvote_last_response, [dialog_state], [upvote_btn, downvote_btn])
+        # btn_list = [upvote_btn, downvote_btn, regenerate_btn, clear_btn]
+        btn_list = [regenerate_btn, clear_btn]
+        # upvote_btn.click(upvote_last_response, [dialog_state], [upvote_btn, downvote_btn])
+        # downvote_btn.click(downvote_last_response, [dialog_state], [upvote_btn, downvote_btn])
         regenerate_btn.click(regenerate, [dialog_state], [dialog_state, chatbot] + btn_list).then(
             http_bot, [dialog_state, input_state, temperature, top_p, max_new_tokens, num_beams, max_turns, force_img_gen],
             [dialog_state, input_state, chatbot] + btn_list)
@@ -487,7 +493,8 @@ if __name__ == '__main__':
         submit_btn.click(
             add_image, [dialog_state, input_state, image], [dialog_state, input_state, image, chatbot] + btn_list).then(
                 add_text, [dialog_state, input_state, text],
-                [dialog_state, input_state, text, chatbot, upvote_btn, downvote_btn, regenerate_btn, clear_btn]).then(
+                # [dialog_state, input_state, text, chatbot, upvote_btn, downvote_btn, regenerate_btn, clear_btn]).then(
+                [dialog_state, input_state, text, chatbot, regenerate_btn, clear_btn]).then(
                     http_bot, [dialog_state, input_state, temperature, top_p, max_new_tokens, num_beams, max_turns, force_img_gen],
                     [dialog_state, input_state, chatbot] + btn_list)
         clear_btn.click(clear_history, None, [dialog_state, input_state, chatbot] + btn_list)

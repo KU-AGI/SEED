@@ -276,6 +276,7 @@ class SEEDDataModule(pl.LightningDataModule):
             self.validation_dataset = CocoDataset(
                 root_dir=self.cfg.dataset.val_config.root_dir,
                 karpathy_file=self.cfg.dataset.val_config.karpathy_file_path,
+                transform=self.transform,
                 tokenizer=None,
                 start_index=self.cfg.dataset.val_config.start_index,
                 end_index=end_index,
