@@ -2,7 +2,7 @@ cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 transform_cfg_path: configs/transform/slot_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/slot_debug
+result_file_path: ./logs/slot_stage2
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
@@ -15,7 +15,7 @@ weight_path: None
 eval: False
 
 dist:
-  n_gpus: 1
+  n_gpus: 4
   n_nodes: 1
 
 dataset:
@@ -65,9 +65,9 @@ experiment:
   grad_accumulation: 2
   check_val_every_n_epoch: 1
   # val_check_interval: 200
-  enable_checkpointing: False
+  enable_checkpointing: True
   log_every_n_steps: 1
-  num_sanity_val_steps: 0
+  num_sanity_val_steps: 1
   num_warmup_steps: 200
   grad_clip_val: 5
 
@@ -75,7 +75,7 @@ optimizer:
   vit_precision: 'fp16'
   diffusion_precision: 'fp16'
   precision: '32'
-  max_lr: 7e-4
+  max_lr: 1e-3
 
 hyperparameters:
   beta_1: 0.9

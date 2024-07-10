@@ -455,7 +455,9 @@ def convert_weights_to_fp16(model: nn.Module):
             if l.bias is not None:
                 l.bias.data = l.bias.data.half()
 
-    model.apply(_convert_weights_to_fp16)
+    # Debug point
+    # model.apply(_convert_weights_to_fp16)
+    model = model.half()
 
 
 def create_eva_vit_g(img_size=224, drop_path_rate=0.4, use_checkpoint=False, precision="fp16"):

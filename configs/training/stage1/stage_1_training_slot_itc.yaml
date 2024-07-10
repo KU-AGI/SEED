@@ -1,27 +1,32 @@
 cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
+# transform_cfg_path: configs/transform/clip_transform.yaml
 transform_cfg_path: configs/transform/slot_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/slot_debug
+result_file_path: ./logs/seed_slot_itc
+# result_file_path: ./logs/seed_slot_layer1
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
-  slot_model_path: /home/zheedong/Projects/latent-slot-diffusion/lsd_log/coco_32slot/stable_lsd/checkpoint-49000
+# slot_cfg_path: /home/zheedong/Projects/latent-slot-diffusion/configs/coco/slot_attn/config_32.json
+slot_cfg_path: /home/zheedong/Projects/latent-slot-diffusion/configs/coco/slot_attn/config_12heads_dino.json
+# slot_cfg_path: /home/zheedong/Projects/latent-slot-diffusion/configs/coco/slot_attn/config_12heads.json
 
 resume: False
+# load_weight: True
+# weight_path: /home/zheedong/Projects/SEED/logs/seed_slot_layer1_dino/lightning_logs/version_11/checkpoints/epoch=25-step=29561.ckpt
 load_weight: False
-weight_path: None
-# weight_path: /home/ubuntu/Projects/SEED_Tokenizer/logs/current_training/nsvq_with_codebook_replacement/checkpoints/epoch=0-step=2000.ckpt
+weight_path: 
 eval: False
 
 dist:
-  n_gpus: 1
+  n_gpus: 2
   n_nodes: 1
 
 dataset:
   train_config:
-    dataset_configs: ['configs/data/cc15m.yaml', 'configs/data/laion-coco-total.yaml', 'configs/data/mscoco.yaml' ,'configs/data/unsplash.yaml']
-    weights: [10, 50, 1, 5]
+    dataset_configs: ['configs/data/cc15m.yaml', 'configs/data/laion-coco.yaml', 'configs/data/mscoco.yaml']
+    weights: [1, 6, 4]
     shardshuffle: 100
     resampled: True
     world_size: 1
@@ -31,13 +36,20 @@ dataset:
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
     root_dir: /ssd0/data/coco/images/val2014
     start_index: 0
-    end_index: 512
+    end_index: 256
   num_workers: 16
   shuffle: True
   text_max_length: 128
 
 stage1:
-  init: 'SEED'
+  init: 'BLIP-2'
+  use_slot: True
+  use_diffusion_loss: True
+  use_causal: True
+  loss_weight:
+    loss_diffusion: 4
+    loss_itc: 1
+  unfreeze_unet: True
 
 stage2:
   bypass_codebook: False
@@ -53,31 +65,32 @@ stage2:
     loss_recon: 4
     loss_generation_embedding: 1 
   recon_s: True
+  unclip: False
 
 experiment:
   seed: 0
-  stage: 2
-  local_batch_size: 1024
+  stage: 1
+  local_batch_size: 180
   val_batch_size: 16
   test_split: train
-  max_epochs: 500
+  max_epochs: 200
   deterministic: False
   grad_accumulation: 2
-  check_val_every_n_epoch: 1
-  # val_check_interval: 200
-  enable_checkpointing: False
+  val_check_interval: 0.5
+  # check_val_every_n_epoch: 1 
+  enable_checkpointing: True
   log_every_n_steps: 1
-  num_sanity_val_steps: 0
-  num_warmup_steps: 200
+  num_sanity_val_steps: 1
+  num_warmup_steps: 20
   grad_clip_val: 5
 
 optimizer:
   vit_precision: 'fp16'
   diffusion_precision: 'fp16'
-  precision: '32'
-  max_lr: 7e-4
+  precision: '16'
+  max_lr: 5e-5
 
 hyperparameters:
   beta_1: 0.9
   beta_2: 0.999
-  weight_decar: 5e-4
+  weight_decay: 1e-2

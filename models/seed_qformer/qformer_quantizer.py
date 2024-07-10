@@ -442,8 +442,8 @@ class Blip2QformerQuantizer(Blip2Base):
             self.visual_encoder = self.visual_encoder.eval()
             self.visual_encoder.train = disabled_train
             logging.info("freeze vision encoder")
-            self.ln_vision.weight.requires_grad = False
-            self.ln_vision.bias.requires_grad = False
+            # self.ln_vision.weight.requires_grad = False
+            # self.ln_vision.bias.requires_grad = False
 
         # 32
         self.codebook_embed_dim = codebook_embed_dim
@@ -564,7 +564,7 @@ class Blip2QformerQuantizer(Blip2Base):
             )
             self.distill_image_proj = nn.Linear(num_query_token * 32, image_features_dim)
     
-    def get_causal_embeddings(self, image):
+    def get_causal_embeddings(self, image, use_slot=False):
         # Yes grad for training
         # with torch.no_grad():
         with self.maybe_autocast():
@@ -582,6 +582,7 @@ class Blip2QformerQuantizer(Blip2Base):
             query_embeds=query_tokens,
             encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_atts,
+            use_slot=use_slot,
             return_dict=True,
         )
         return query_output.last_hidden_state

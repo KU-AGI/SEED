@@ -81,7 +81,7 @@ class Attention(nn.Module):
     def get_attention_map(self):
         return self.attention_map
 
-    def forward(self, x, register_hook=False):
+    def forward(self, x, register_hook=False, use_causal_mask=False):
         B, N, C = x.shape
         qkv = (self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4))
         q, k, v = (
@@ -90,7 +90,11 @@ class Attention(nn.Module):
             qkv[2],
         )  # make torchscript happy (cannot use tensor as tuple)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = (q @ k.transpose(-2, -1)) * self.scale # [b, num_heads, N, N]
+        if use_causal_mask:
+            # Causal mask set to -10000
+            causal_mask = torch.triu(torch.full((N, N), -10000), diagonal=1).to(attn.device)
+            attn = attn + causal_mask
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -144,8 +148,8 @@ class Block(nn.Module):
         #     self.attn = checkpoint_wrapper(self.attn)
         #     self.mlp = checkpoint_wrapper(self.mlp)
 
-    def forward(self, x, register_hook=False):
-        x = x + self.drop_path(self.attn(self.norm1(x), register_hook=register_hook))
+    def forward(self, x, register_hook=False, use_causal_mask=False):
+        x = x + self.drop_path(self.attn(self.norm1(x), register_hook=register_hook, use_causal_mask=use_causal_mask))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 

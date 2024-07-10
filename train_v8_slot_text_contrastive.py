@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from pytorch_lightning.strategies import DDPStrategy, DDPFullyShardedStrategy
 from einops import rearrange
 import transformers
+from transformers import CLIPVisionModelWithProjection, CLIPTokenizer
 
 from pytorch_lightning import loggers as pl_loggers
 from functools import partial
@@ -44,6 +45,10 @@ from utils.config import build_config
 
 from lavis.models import load_model
 from lavis.common.dist_utils import is_dist_avail_and_initialized
+
+from diffusers import DPMSolverMultistepScheduler
+
+from models.slot_attention.slot_attn import MultiHeadSTEVESA
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
@@ -76,6 +81,19 @@ class GatherLayer(torch.autograd.Function):
         torch.distributed.all_reduce(all_gradients)
         return all_gradients[torch.distributed.get_rank()]
 
+class DINOBackbone(nn.Module):
+    def __init__(self, dinov2):
+        super().__init__()
+        self.dinov2 = dinov2
+
+    def forward(self, x):
+        enc_out = self.dinov2.forward_features(x)
+        return rearrange(
+            enc_out["x_norm_patchtokens"], 
+            "b (h w ) c -> b c h w",
+            h=int(np.sqrt(enc_out["x_norm_patchtokens"].shape[-2]))
+        )
+
 class SEEDTrainingWrapper(LightningModule):
     """Training wrapper for SEED
 
@@ -96,8 +114,13 @@ class SEEDTrainingWrapper(LightningModule):
             from_pretrained=True if cfg.stage1.init == "SEED" else False,
             vit_precision=cfg.optimizer.vit_precision,
             diffusion_precision=cfg.optimizer.diffusion_precision,
+            unclip=cfg.stage2.unclip,
             legacy=cfg.stage2.vq.legacy,
         )
+
+        # Debug
+        self.image_tokenizer.model = self.image_tokenizer.model.to("cpu")
+        self.image_tokenizer.model.visual_encoder = self.image_tokenizer.model.visual_encoder.to(self.device)
 
         self.B = None
 
@@ -106,14 +129,37 @@ class SEEDTrainingWrapper(LightningModule):
         # For diffusion DDP
         if self.image_tokenizer.diffusion_model is not None:
             self.feature_extractor = self.image_tokenizer.diffusion_model.feature_extractor
-            self.image_encoder = self.image_tokenizer.diffusion_model.image_encoder
-            self.image_normalizer = self.image_tokenizer.diffusion_model.image_normalizer
-            self.image_noising_scheduler = self.image_tokenizer.diffusion_model.image_noising_scheduler
-            self.tokenizer = self.image_tokenizer.diffusion_model.tokenizer
-            self.text_encoder = self.image_tokenizer.diffusion_model.text_encoder
+            if self.cfg.stage2.unclip:
+                self.image_encoder = self.image_tokenizer.diffusion_model.image_encoder
+                self.image_normalizer = self.image_tokenizer.diffusion_model.image_normalizer
+                self.image_noising_scheduler = self.image_tokenizer.diffusion_model.image_noising_scheduler
+            else:
+                self.image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14")
+                self.image_normalizer = None
+                self.image_noising_scheduler = None
+            if self.image_tokenizer.diffusion_model.text_encoder is not None:
+                self.tokenizer = self.image_tokenizer.diffusion_model.tokenizer
+            else:
+                self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+            if self.image_tokenizer.diffusion_model.text_encoder is not None:
+                self.text_encoder = self.image_tokenizer.diffusion_model.text_encoder
             self.unet = self.image_tokenizer.diffusion_model.unet
             self.scheduler = self.image_tokenizer.diffusion_model.scheduler
             self.vae = self.image_tokenizer.diffusion_model.vae
+
+            # Scheduler for validation
+            scheduler_args = {}
+            if "variance_type" in self.scheduler.config:
+                variance_type = self.scheduler.config.variance_type
+                
+                if variance_type in ["learned", "learned_range"]:
+                    variance_type = "fixed_small"
+
+                scheduler_args["variance_type"] = variance_type
+                
+            self.val_schduler = DPMSolverMultistepScheduler.from_config(
+                self.scheduler.config, **scheduler_args
+            )
 
         # For logging
         self.pil_to_tensor = transforms.ToTensor()
@@ -128,30 +174,87 @@ class SEEDTrainingWrapper(LightningModule):
         else:
             self.recon_s = False
 
+        # Test for query token xaiver uniform initialization
+        if cfg.stage1.use_slot:
+            if not cfg.resume and not cfg.load_weight:
+                torch.nn.init.xavier_uniform_(self.image_tokenizer.model.query_tokens)
+        
+        # slot out linear
+        self.out_layer_norm = nn.LayerNorm(768)
+        self.out_linear = nn.Linear(768, 1024)
+
+        self.transform_256 = transforms.Resize((256, 256), antialias=True)
+
+        self.normalize_diffusion = transforms.Normalize(mean=[0.5], std=[0.5])
+        self.normalize_vit = transforms.Normalize(
+                                mean=[0.485, 0.456, 0.406],
+                                std=[0.229, 0.224, 0.225],
+                            )
+
+        self.save_path = None
+        
+        slot_attn_config = MultiHeadSTEVESA.load_config(cfg.slot_cfg_path)
+        self.slot_attention = MultiHeadSTEVESA.from_config(slot_attn_config)            
+        # self.slot_attention = MultiHeadSTEVESA.from_pretrained("/home/zheedong/Projects/latent-slot-diffusion/lsd_log/coco_32slot/stable_lsd/checkpoint-49000/multiheadstevesa")
+
+        dinov2 = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+        self.backbone = DINOBackbone(dinov2)
+        # self.backbone = self.image_tokenizer.model.visual_encoder
+
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, 32, 768))
+        self.causal_transformer = nn.ModuleList([
+            Block(dim=768,
+                    num_heads=12,
+                    mlp_ratio=4.0,
+                    qkv_bias=True,
+                    qk_scale=None,
+                    drop=0.0,
+                    attn_drop=0.0,
+                    drop_path=0.0,
+                    norm_layer=partial(nn.LayerNorm, eps=1e-6)) for _ in range(4)
+        ])
+
+        llama_ver = "meta-llama/Llama-2-7b-chat-hf"
+        self.llama_model = transformers.AutoModelForCausalLM.from_pretrained(llama_ver)
+        self.llama_tokenizer = transformers.AutoTokenizer.from_pretrained(llama_ver)
+
     def setup(self, stage):
         # Setup training parameter
         self.image_tokenizer.model.train()
         for param in self.image_tokenizer.model.parameters():
-            param.requires_grad = True
+            param.requires_grad = False
+        self.image_tokenizer.model = self.image_tokenizer.model.to("cpu")
 
         # Freeze ViT Encoder
         for param in self.image_tokenizer.model.visual_encoder.parameters():
             param.requires_grad = False
+        self.image_tokenizer.model.visual_encoder = self.image_tokenizer.model.visual_encoder.to("cpu")
         for param in self.image_tokenizer.model.ln_vision.parameters():
+            param.requires_grad = False
+        self.image_tokenizer.model.ln_vision = self.image_tokenizer.model.ln_vision.to("cpu")
+
+        # Freeze Text Encoder
+        print("----------------- Freeze Text Encoder -----------------")
+        for param in self.image_tokenizer.model.Qformer.bert.parameters():
             param.requires_grad = False
 
         # Diffusion frozen
         if self.image_tokenizer.diffusion_model is not None:
-            for param in self.image_tokenizer.diffusion_model.image_encoder.parameters():
+            for param in self.image_encoder.parameters():
                 param.requires_grad = False
-            for param in self.image_tokenizer.diffusion_model.image_normalizer.parameters():
-                param.requires_grad = False
-            for param in self.image_tokenizer.diffusion_model.text_encoder.parameters():
-                param.requires_grad = False
+            if self.image_normalizer is not None:
+                for param in self.image_tokenizer.diffusion_model.image_normalizer.parameters():
+                    param.requires_grad = False
+            if self.image_noising_scheduler is not None:
+                for param in self.image_tokenizer.diffusion_model.text_encoder.parameters():
+                    param.requires_grad = False
             # In this case, unet is frozen
-            for param in self.image_tokenizer.diffusion_model.unet.parameters():
+            for param in self.unet.parameters():
                 param.requires_grad = False
-            for param in self.image_tokenizer.diffusion_model.vae.parameters():
+            for param in self.vae.parameters():
                 param.requires_grad = False
 
         if self.stage == 1:
@@ -161,6 +264,7 @@ class SEEDTrainingWrapper(LightningModule):
                 # Update the model with the weights
                 filtered_state_dict = {k: v for k, v in blip_model.state_dict().items() if k in self.image_tokenizer.model.state_dict()}
                 self.image_tokenizer.model.load_state_dict(filtered_state_dict, strict=False)
+
             elif self.cfg.stage1.init == "SEED":
                 print("Load init weights from SEED")
 
@@ -244,7 +348,7 @@ class SEEDTrainingWrapper(LightningModule):
         """        
         gt_text_clip_embeddings = []
         with torch.no_grad():
-            for idx in range(self.B):
+            for idx in range(len(batch_text)):
                 gt_text_clip_embeddings.append(
                     self.tokenizer(batch_text[idx]).squeeze().to(self.device)
                 )
@@ -268,7 +372,7 @@ class SEEDTrainingWrapper(LightningModule):
         return self.image_encoder(batch_img).image_embeds.to(self.device)
 
     def get_causal_embeddings(self, image):
-        return self.image_tokenizer.model.get_causal_embeddings(image)
+        return self.image_tokenizer.model.get_causal_embeddings(image, self.cfg.stage1.use_slot)
 
     def logging_train_stage2(self, generation_embedding_cosine_similarity, loss_dict, is_val=False):
         stage = "val" if is_val else "train"
@@ -398,6 +502,24 @@ class SEEDTrainingWrapper(LightningModule):
         output = torch.cat(tensors_gather, dim=0)
         return output
 
+    def get_llama_embedding(self, text):
+        """_summary_
+            Get LLAMA text embedding
+            Return is [b, n, 4096]
+
+        Args:
+            text (str): string of caption
+        """
+        with torch.no_grad():
+            embedding = self.llama_model(
+                torch.IntTensor(
+                        [self.llama_tokenizer(text)['input_ids'][0]]
+                    ),
+                    return_dict=True, output_hidden_states=True
+                )['hidden_states'][0]
+        return embedding
+        
+
     def get_stage_1_loss_use_last_token(self, batch, batch_idx: int):
         """
             Contrastive loss using last token of the query_output
@@ -412,9 +534,19 @@ class SEEDTrainingWrapper(LightningModule):
             image, text = batch
 
         with torch.no_grad():
-            image_embeds = self.image_tokenizer.model.ln_vision(
-                self.image_tokenizer.model.visual_encoder(image)
-            )
+            with torch.autocast(device_type="cuda", enabled=False):
+                original_data_type = image.dtype
+                # TODO : precision issue
+                if self.cfg.optimizer.vit_precision == "fp16":
+                    image = image.half()
+
+                image_embeds = self.image_tokenizer.model.ln_vision(
+                    self.image_tokenizer.model.visual_encoder(image)
+                )
+
+                image_embeds = image_embeds.to(original_data_type)
+
+
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(self.device)
 
         query_tokens = self.image_tokenizer.model.query_tokens.expand(image_embeds.shape[0], -1, -1)
@@ -427,6 +559,8 @@ class SEEDTrainingWrapper(LightningModule):
             encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_atts,
             return_dict=True,
+            use_slot=self.cfg.stage1.use_slot,
+            use_caual=self.cfg.stage1.use_causal,
         )
 
         # Use last hidden state
@@ -449,7 +583,6 @@ class SEEDTrainingWrapper(LightningModule):
             text_tokens.input_ids.to(self.device),
             attention_mask=text_tokens.attention_mask.to(self.device),
             return_dict=True,
-            use_slot=self.cfg.stage1.use_slot,
         )
 
         # CLS token
@@ -518,6 +651,207 @@ class SEEDTrainingWrapper(LightningModule):
 
         return loss_itc
 
+    def debug_lsd_loss(self, batch, batch_idx: int, is_validation=False):
+        pixel_values = self.transform_256(batch[0])
+        pixel_values = self.normalize_diffusion(pixel_values)
+
+        # Convert images to latent space
+        model_input = self.vae.encode(pixel_values).latent_dist.sample()
+        model_input = model_input * self.vae.config.scaling_factor
+
+        # Sample noise that we'll add to the model input
+        noise = torch.randn_like(model_input)
+
+        bsz, channels, height, width = model_input.shape
+        # Sample a random timestep for each image
+        timesteps = torch.randint(
+            0, self.scheduler.config.num_train_timesteps, (bsz,), device=model_input.device
+        )
+        timesteps = timesteps.long()
+
+        # Add noise to the model input according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_model_input = self.scheduler.add_noise(
+            model_input, noise, timesteps)
+
+        # timestep is not used, but should we?
+        backbone_input = self.normalize_vit(batch[0])
+        feat = self.backbone(backbone_input)
+
+        slots, attn = self.slot_attention(feat[:, None])  # for the time dimension
+        slots = slots[:, 0]
+
+        # Predict the noise residual
+        model_pred = self.unet(
+            noisy_model_input, timesteps, slots,
+        ).sample
+
+        # Get the target for loss depending on the prediction type
+        if self.scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif self.scheduler.config.prediction_type == "v_prediction":
+            target = self.scheduler.get_velocity(
+                model_input, noise, timesteps)
+        else:
+            raise ValueError(
+                f"Unknown prediction type {self.scheduler.config.prediction_type}")
+
+        # Compute instance loss
+        loss = F.mse_loss(model_pred.float(),
+                            target.float(), reduction="mean")
+
+        if not is_validation:
+            self.log(
+                "train/loss_diffusion",
+                loss,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+
+        return loss, slots
+
+    def get_diffusion_text_contrastive_loss(self, batch, batch_idx: int, is_validation=False):
+        pixel_values = self.transform_256(batch[0])
+        pixel_values = self.normalize_diffusion(pixel_values)
+
+        # Convert images to latent space
+        model_input = self.vae.encode(pixel_values).latent_dist.sample()
+        model_input = model_input * self.vae.config.scaling_factor
+
+        # Sample noise that we'll add to the model input
+        noise = torch.randn_like(model_input)
+
+        bsz, channels, height, width = model_input.shape
+        # Sample a random timestep for each image
+        timesteps = torch.randint(
+            0, self.scheduler.config.num_train_timesteps, (bsz,), device=model_input.device
+        )
+        timesteps = timesteps.long()
+
+        # Add noise to the model input according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_model_input = self.scheduler.add_noise(
+            model_input, noise, timesteps)
+
+        # timestep is not used, but should we?
+        backbone_input = self.normalize_vit(batch[0])
+        feat = self.backbone(backbone_input)
+
+        slots, attn = self.slot_attention(feat[:, None], apply_out_linear=False)  # for the time dimension
+        slots_1024 = self.slot_attention.out_linear(slots)
+        slots_1024 = slots_1024[:, 0]
+
+        # Predict the noise residual
+        model_pred = self.unet(
+            noisy_model_input, timesteps, slots_1024,
+        ).sample
+
+        # Get the target for loss depending on the prediction type
+        if self.scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif self.scheduler.config.prediction_type == "v_prediction":
+            target = self.scheduler.get_velocity(
+                model_input, noise, timesteps)
+        else:
+            raise ValueError(
+                f"Unknown prediction type {self.scheduler.config.prediction_type}")
+
+        # Compute instance loss
+        loss_diffusion = F.mse_loss(model_pred.float(),
+                            target.float(), reduction="mean")
+
+        ###============== Image-text Contrastive ===================###
+        # Remove T dim
+        slots = rearrange(slots, "bs 1 n_s n_d -> bs n_s n_d")
+
+        # Image feat from slot attention
+        # Add positional embedding for slots
+        pos_embed_applied_slot = slots + self.pos_embed.repeat(slots.size(0), 1, 1)
+
+        # Apply Causal Transformer
+        for blk in self.causal_transformer:
+            pos_embed_applied_slot = blk(pos_embed_applied_slot, use_causal_mask=True)
+
+        image_feats = pos_embed_applied_slot
+        image_feats = F.normalize(image_feats, dim=-1)
+        
+        text_tokens = self.image_tokenizer.model.tokenizer(
+            batch[1],
+            padding="max_length",
+            truncation=True,
+            max_length=self.cfg.dataset.text_max_length,
+            return_tensors="pt",
+        )
+        text_output = self.image_tokenizer.model.Qformer.bert(
+            text_tokens.input_ids.to(self.device),
+            attention_mask=text_tokens.attention_mask.to(self.device),
+            return_dict=True,
+        )
+        text_feat = F.normalize(text_output.last_hidden_state[:, 0, :], dim=-1)
+
+        # Gather across all GPUs
+
+        image_feats_all = self.all_gather_with_grad(image_feats)
+        text_feat_all = self.all_gather_with_grad(text_feat)  # [batch_size*num_gpu, embed_dim]
+
+        sim_q2t = torch.matmul(
+            rearrange(image_feats, "bs n d -> bs 1 n d"), rearrange(text_feat_all, "(bs ngpus) d -> (bs ngpus) d 1", bs=bsz)
+        ).squeeze() # [batch_size, batch_size*num_gpu, num_query_tokens]
+
+        # Use last token
+        sim_i2t = sim_q2t[:, :, -1]
+        sim_i2t = sim_i2t / self.temp # [batch_size, batch_size*num_gpu]
+        
+        sim_t2q = torch.matmul(
+            rearrange(text_feat, "bs d -> bs 1 1 d"), rearrange(image_feats_all, "(bs ngpus) n d -> (bs ngpus) d n", bs=bsz)
+        ).squeeze()
+
+        sim_t2i = sim_t2q[:, :, -1]
+        sim_t2i = sim_t2i / self.temp # [batch_size, batch_size*num_gpu]
+        
+        rank = dist.get_rank()
+        targets = torch.linspace(rank * bsz, rank * bsz + bsz - 1, bsz, dtype=int).to(self.device)
+        
+        loss_itc = (
+            F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
+            + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
+        ) / 2
+
+        loss = self.cfg.stage1.loss_weight.loss_diffusion * loss_diffusion + \
+            self.cfg.stage1.loss_weight.loss_itc * loss_itc
+
+        cur_stage = "train" if not is_validation else "val"
+        self.log(
+            f"{cur_stage}/loss_diffusion",
+            loss_diffusion,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+
+        self.log(
+            f"{cur_stage}/loss_itc",
+            loss_itc,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+
+        self.log(
+            f"{cur_stage}/loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+
+        return loss, slots_1024
+
     @torch.no_grad()
     def check_image_text_similarity(self, batch, batch_idx: int, save_dir="image_text_similarity"):
         if len(batch) == 3:
@@ -527,9 +861,18 @@ class SEEDTrainingWrapper(LightningModule):
         rank = dist.get_rank()
 
         with torch.no_grad():
-            image_embeds = self.image_tokenizer.model.ln_vision(
-                self.image_tokenizer.model.visual_encoder(image)
-            )
+            with torch.autocast(device_type="cuda", enabled=False):
+                # TODO : precision issue
+                if self.cfg.optimizer.vit_precision == "fp16":
+                    image = image.half()
+
+                image_embeds = self.image_tokenizer.model.ln_vision(
+                    self.image_tokenizer.model.visual_encoder(image)
+                )
+
+                if self.cfg.optimizer.vit_precision == "fp16":
+                    image_embeds = image_embeds.float()
+
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(self.device)
 
         query_tokens = self.image_tokenizer.model.query_tokens.expand(image_embeds.shape[0], -1, -1)
@@ -542,6 +885,8 @@ class SEEDTrainingWrapper(LightningModule):
             encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_atts,
             return_dict=True,
+            use_slot=self.cfg.stage1.use_slot,
+            use_causal=self.cfg.stage1.use_causal,
         )
 
         # Use last hidden state
@@ -897,7 +1242,10 @@ class SEEDTrainingWrapper(LightningModule):
         self.B = image.shape[0]
 
         if self.stage == 1:
-            loss = self.get_stage_1_loss_use_last_token(batch, batch_idx)
+            if self.cfg.stage1.use_diffusion_loss:
+                loss, _ = self.get_diffusion_text_contrastive_loss(batch, batch_idx)
+            else:
+                loss = self.get_stage_1_loss_use_last_token(batch, batch_idx)
         elif self.stage == 2:
             loss, _ = self.get_stage_2_loss(batch, batch_idx)
         
@@ -907,6 +1255,14 @@ class SEEDTrainingWrapper(LightningModule):
         # Compute the 2-norm for each layer
         # If using mixed precision, the gradients are already unscaled here
         # {'grad_2.0_norm/weight': 0.0003, 'grad_2.0_norm/bias': 0.0, 'grad_2.0_norm_total': 0.0003}
+        norm_slot = grad_norm(self.slot_attention, norm_type=2)
+        for norm in norm_slot.keys():
+            self.logger.experiment.add_scalar(
+                f"grad_norm/slot_attention/{norm}",
+                norm_slot[norm],
+                global_step=self.global_step,
+            )
+
         if self.cfg.experiment.stage == 1:
             norms_0 = grad_norm(self.image_tokenizer.model.Qformer.bert.encoder.layer[0].attention.self.value, norm_type=2)
             for norm in norms_0.keys():
@@ -915,20 +1271,30 @@ class SEEDTrainingWrapper(LightningModule):
                     norms_0[norm],
                     global_step=self.global_step,
                 )
-            norms_1 = grad_norm(self.image_tokenizer.model.Qformer.bert.encoder.layer[1].attention.self.value, norm_type=2)
-            for norm in norms_1.keys():
+            norms_cross_0 = grad_norm(self.image_tokenizer.model.Qformer.bert.encoder.layer[0].crossattention.self.value, norm_type=2)
+            for norm in norms_cross_0.keys():
                 self.logger.experiment.add_scalar(
-                    f"grad_norm/image_tokenizer/model/Qformer/bert/encoder/layer/1/attention/self/value/{norm}",
-                    norms_1[norm],
+                    f"grad_norm/image_tokenizer/model/Qformer/bert/encoder/layer/0/crossattention/self/value/{norm}",
+                    norms_cross_0[norm],
                     global_step=self.global_step,
                 )
-            norms_7 = grad_norm(self.image_tokenizer.model.Qformer.bert.encoder.layer[7].attention.self.value, norm_type=2)
-            for norm in norms_7.keys():
-                self.logger.experiment.add_scalar(
-                    f"grad_norm/image_tokenizer/model/Qformer/bert/encoder/layer/7/attention/self/value/{norm}",
-                    norms_7[norm],
-                    global_step=self.global_step,
-                )
+            try:
+                norms_1 = grad_norm(self.image_tokenizer.model.Qformer.bert.encoder.layer[1].attention.self.value, norm_type=2)
+                for norm in norms_1.keys():
+                    self.logger.experiment.add_scalar(
+                        f"grad_norm/image_tokenizer/model/Qformer/bert/encoder/layer/1/attention/self/value/{norm}",
+                        norms_1[norm],
+                        global_step=self.global_step,
+                    )
+                norms_7 = grad_norm(self.image_tokenizer.model.Qformer.bert.encoder.layer[7].attention.self.value, norm_type=2)
+                for norm in norms_7.keys():
+                    self.logger.experiment.add_scalar(
+                        f"grad_norm/image_tokenizer/model/Qformer/bert/encoder/layer/7/attention/self/value/{norm}",
+                        norms_7[norm],
+                        global_step=self.global_step,
+                    )
+            except:
+                pass
         elif self.cfg.experiment.stage == 2:
             codebook_norm = grad_norm(self.image_tokenizer.model.quantize.embedding, norm_type=2)
             for norm in codebook_norm.keys():
@@ -973,13 +1339,45 @@ class SEEDTrainingWrapper(LightningModule):
             tb_log_dir = self.cfg.result_file_path  # Fallback directory if logger is not set
 
         if self.stage == 1:
-            save_path = f"{tb_log_dir}/histogram"
-            os.makedirs(save_path, exist_ok=True)
+            if not self.cfg.stage1.use_diffusion_loss:
+                self.save_path = f"{tb_log_dir}/histogram"
+                os.makedirs(self.save_path, exist_ok=True)
 
-            save_path = f"{tb_log_dir}/histogram/epoch_{self.current_epoch}"
-            os.makedirs(save_path, exist_ok=True)
+                self.save_path = f"{tb_log_dir}/histogram/epoch_{self.current_epoch}"
+                os.makedirs(self.save_path, exist_ok=True)
 
-            self.check_image_text_similarity(batch, batch_idx, save_dir=save_path)
+                self.check_image_text_similarity(batch, batch_idx, save_dir=save_path)
+            elif self.cfg.stage1.use_diffusion_loss:
+                self.save_path = f"{tb_log_dir}/reconstructed_images"
+                os.makedirs(self.save_path, exist_ok=True)
+                
+                self.save_path = f"{tb_log_dir}/reconstructed_images/epoch_{self.current_epoch}"
+                os.makedirs(self.save_path, exist_ok=True)
+
+                img, text, image_id = batch
+                loss, slots = self.get_diffusion_text_contrastive_loss(batch, batch_idx, is_validation=True)
+
+                # Change validation scheduler
+                cur_scheduler = self.image_tokenizer.diffusion_model.scheduler
+                self.image_tokenizer.diffusion_model.scheduler = self.val_schduler
+
+                reconstructed_images = self.image_tokenizer.diffusion_model(
+                    prompt_embeds=slots,
+                    height=256,
+                    width=256,
+                    guidance_scale=1.3,
+                    # num_inference_steps=25,
+                    num_inference_steps=100,
+                ).images
+
+                # Return it to original scheduler
+                self.image_tokenizer.diffusion_model.scheduler = cur_scheduler
+
+                for img, cur_id in zip(reconstructed_images, image_id):
+                    # save PIL image to save_path
+                    img.save(f"{self.save_path}/{cur_id}")
+
+
         elif self.stage == 2:
             image, captions, image_id = batch
             bypass_codebook = self.cfg.stage2.bypass_codebook
@@ -995,14 +1393,14 @@ class SEEDTrainingWrapper(LightningModule):
                     latents=self.image_tokenizer.latents,
                 ).images
                 
-            save_path = f"{tb_log_dir}/images/version_{self.logger.version}/epoch_{self.current_epoch}/images"
-            os.makedirs(save_path, exist_ok=True)
+            self.save_path = f"{tb_log_dir}/images/version_{self.logger.version}/epoch_{self.current_epoch}/images"
+            os.makedirs(self.save_path, exist_ok=True)
 
             tensor_images = []
 
             for img, cur_id in zip(reconstructed_images, image_id):
                 # save PIL image to save_path
-                img.save(f"{save_path}/{cur_id}")
+                img.save(f"{self.save_path}/{cur_id}")
 
                 # For tensorboard logging
                 tensor_images.append(self.pil_to_tensor(img).unsqueeze(0))
@@ -1044,7 +1442,7 @@ class SEEDTrainingWrapper(LightningModule):
             tb_log_dir = self.cfg.result_file_path
 
         original_image_dir = self.cfg.dataset.val_config.root_dir
-        generated_image_dir = f"{tb_log_dir}/images/version_{self.logger.version}/epoch_{self.current_epoch}/images"
+        generated_image_dir = self.save_path
         clip_score = calculate_clip_s_for_folder(original_image_dir, generated_image_dir)
         
         print(f"clip score: {clip_score}")
@@ -1075,6 +1473,14 @@ class SEEDTrainingWrapper(LightningModule):
                 continue  # frozen weights
             if p.ndim < 2 or "bias" in n or "ln" in n or "bn" in n:
                 p_non_wd.append(p)
+            else:
+                p_wd.append(p)
+            num_parameters += p.data.nelement()
+        for n, p in self.slot_attention.named_parameters():
+            if not p.requires_grad:
+                continue
+            # if p.ndim < 2 or "bias" in n or "ln" in n or "bn" in n:
+            #     p_non_wd.append(p)
             else:
                 p_wd.append(p)
             num_parameters += p.data.nelement()
@@ -1151,12 +1557,12 @@ if __name__ == "__main__":
         deterministic=cfg.experiment.deterministic,
         logger=tb_logger,
         log_every_n_steps=cfg.experiment.log_every_n_steps,
-        # val_check_interval=cfg.experiment.val_check_interval,
-        check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
+        val_check_interval=cfg.experiment.val_check_interval,
+        # check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
         enable_checkpointing=cfg.experiment.enable_checkpointing,
         num_sanity_val_steps=cfg.experiment.num_sanity_val_steps,
         precision=str(cfg.optimizer.precision),
-        callbacks=[ModelSummary(max_depth=3), lr_logger] + [checkpoint_callback] if cfg.experiment.enable_checkpointing else [],
+        callbacks=[ModelSummary(max_depth=3), lr_logger], # + [checkpoint_callback] if cfg.experiment.enable_checkpointing else [],
         accumulate_grad_batches=cfg.experiment.grad_accumulation,
         gradient_clip_val=cfg.experiment.grad_clip_val,
     )

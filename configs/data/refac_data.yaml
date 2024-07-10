@@ -1,0 +1,28 @@
+tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
+transform_cfg_path: configs/transform/slot_transform.yaml
+
+seed: 42
+
+# for distributed training (=num of gpu)
+rank: 2
+world_size: 1              
+
+data_0:
+  task_type: 0 # pair dataset
+  data_dir: /ssd0/data/mscoco/{00000..00059}.tar
+  data_size: 600000
+  batch_size: 128
+  max_length: 32
+  reverse_ratio: 0.0
+  shardshuffle: 100
+  resampled: True
+
+data_1:
+  task_type: 0
+  data_dir: /ssd0/data/laion-coco/{00000..66302}.tar
+  data_size: 660000000
+  batch_size: 128
+  max_length: 32
+  reverse_ratio: 0.0
+  shardshuffle: 100
+  resampled: True

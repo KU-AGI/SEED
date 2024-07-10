@@ -5,7 +5,10 @@ import torch
 import os
 # from timm.models import create_model
 from typing import Any, Dict, List, Optional, Union
-from transformers import LlamaTokenizer
+from transformers import (
+    LlamaTokenizer,
+    CLIPTokenizer,
+)
 # from torchvision.transforms.functional import pil_to_tensor
 
 # import torch
@@ -15,7 +18,14 @@ from torchvision import transforms
 # from qformer.qformer_quantizer import Blip2QformerQuantizer
 # from diffusers import StableUnCLIPImg2ImgPipeline
 from .pipeline_stable_unclip_img2img import StableUnCLIPImg2ImgPipeline
-from diffusers import DiffusionPipeline, DDPMScheduler
+from diffusers import (
+    DiffusionPipeline,
+    AutoencoderKL,
+    DDPMScheduler,
+    StableDiffusionPipeline,
+    UNet2DConditionModel,
+    DiffusionPipeline,
+)
 
 import pdb
 
@@ -33,6 +43,7 @@ class ImageTokenizer(nn.Module):
                  from_pretrained=True,
                  vit_precision='fp16',
                  diffusion_precision='fp16',
+                 unclip=True,
                  **kwargs):
         super().__init__()
         from .seed_qformer.qformer_quantizer import Blip2QformerQuantizer
@@ -48,15 +59,32 @@ class ImageTokenizer(nn.Module):
 
         if diffusion_model_path is not None and load_diffusion:
             fp16 = True if diffusion_precision == 'fp16' else False
-            diffusion_model = DiffusionPipeline.from_pretrained(diffusion_model_path,
-                                                                torch_dtype=torch.float16 if fp16 else torch.float32)
-            diffusion_model = StableUnCLIPImg2ImgPipeline.from_pretrained(diffusion_model_path,
-                                                                          torch_dtype=dict(fp16=torch.float16, fp32=torch.float32)[diffusion_precision])
+            # diffusion_model = DiffusionPipeline.from_pretrained(diffusion_model_path,
+            #                                                     torch_dtype=torch.float16 if fp16 else torch.float32)
+            if unclip:
+                diffusion_model = StableUnCLIPImg2ImgPipeline.from_pretrained(diffusion_model_path,
+                                                                            torch_dtype=dict(fp16=torch.float16, fp32=torch.float32)[diffusion_precision])
             # Test for Stable Diffusion 2.1
-            # diffusion_model = DiffusionPipeline.from_pretrained(diffusion_model_path)
-            # diffusion_model.scheduler = DDPMScheduler.from_pretrained(
-            #     diffusion_model_path, subfolder="scheduler"
-            # )
+            else:
+                pretrained_model_name = "stabilityai/stable-diffusion-2-1"
+                diffusion_model = StableDiffusionPipeline.from_pretrained(pretrained_model_name,
+                                                                        torch_dtype=dict(fp16=torch.float16, fp32=torch.float32)[diffusion_precision])
+                diffusion_model.scheduler = DDPMScheduler.from_pretrained(
+                    pretrained_model_name, subfolder="scheduler", torch_dtype=dict(fp16=torch.float16, fp32=torch.float32)[diffusion_precision])
+                # vae = AutoencoderKL.from_pretrained(
+                #     pretrained_model_name, subfolder="vae", torch_dtype=dict(fp16=torch.float16, fp32=torch.float32)[diffusion_precision])
+                # unet = UNet2DConditionModel.from_pretrained(
+                #     pretrained_model_name, subfolder="unet", torch_dtype=dict(fp16=torch.float16, fp32=torch.float32)[diffusion_precision])
+                # diffusion_model = StableDiffusionPipeline(
+                #     vae=vae,
+                #     text_encoder=None,
+                #     tokenizer=None,
+                #     unet=unet,
+                #     scheduler=scheduler,
+                #     safety_checker=None,
+                #     feature_extractor=None,
+                #     requires_safety_checker=False,
+                # )    
         else:
             diffusion_model = None
             self.diffusion_model = None

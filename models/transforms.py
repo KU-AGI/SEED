@@ -1,7 +1,7 @@
 from torchvision import transforms
 
 
-def get_transform(type='clip', keep_ratio=True, image_size=224):
+def get_transform(type='clip', keep_ratio=True, image_size=224, normalize=True):
     if type == 'clip':
         transform = []
         if keep_ratio:
@@ -13,8 +13,11 @@ def get_transform(type='clip', keep_ratio=True, image_size=224):
             transform.append(transforms.Resize((image_size, image_size), antialias=True))
         transform.extend([
             transforms.ToTensor(),
-            transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
         ])
+        if normalize:
+            transform.append(
+                transforms.Normalize(mean=(0.43216, 0.394666, 0.37645), std=(0.22803, 0.22145, 0.216989))
+            )
 
         return transforms.Compose(transform)
     else:

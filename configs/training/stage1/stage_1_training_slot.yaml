@@ -1,26 +1,24 @@
 cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
-transform_cfg_path: configs/transform/slot_transform.yaml
+transform_cfg_path: configs/transform/clip_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/slot_debug
+result_file_path: ./logs/seed_slot_stage1
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
-  slot_model_path: /home/zheedong/Projects/latent-slot-diffusion/lsd_log/coco_32slot/stable_lsd/checkpoint-49000
 
-resume: False
+resume: True
 load_weight: False
-weight_path: None
-# weight_path: /home/ubuntu/Projects/SEED_Tokenizer/logs/current_training/nsvq_with_codebook_replacement/checkpoints/epoch=0-step=2000.ckpt
+weight_path: /home/zheedong/Projects/SEED/logs/seed_slot_stage1/lightning_logs/version_4/checkpoints/epoch=15-step=15632.ckpt
 eval: False
 
 dist:
-  n_gpus: 1
+  n_gpus: 4
   n_nodes: 1
 
 dataset:
   train_config:
-    dataset_configs: ['configs/data/cc15m.yaml', 'configs/data/laion-coco-total.yaml', 'configs/data/mscoco.yaml' ,'configs/data/unsplash.yaml']
+    dataset_configs: ['configs/data/cc15m.yaml', 'configs/data/laion-coco-total.yaml', 'configs/data/mscoco.yaml', 'configs/data/unsplash.yaml']
     weights: [10, 50, 1, 5]
     shardshuffle: 100
     resampled: True
@@ -31,17 +29,18 @@ dataset:
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
     root_dir: /ssd0/data/coco/images/val2014
     start_index: 0
-    end_index: 512
+    end_index: 256
   num_workers: 16
   shuffle: True
   text_max_length: 128
 
 stage1:
   init: 'SEED'
+  use_slot: True
 
 stage2:
   bypass_codebook: False
-  load_diffusion: True
+  load_diffusion: False
   vq:
     type: 'nsvq' # ['vq2', 'ema_vq', nsvq']
     legacy: False
@@ -56,28 +55,28 @@ stage2:
 
 experiment:
   seed: 0
-  stage: 2
-  local_batch_size: 1024
+  stage: 1
+  local_batch_size: 160
   val_batch_size: 16
   test_split: train
-  max_epochs: 500
+  max_epochs: 40
   deterministic: False
-  grad_accumulation: 2
+  grad_accumulation: 1
   check_val_every_n_epoch: 1
-  # val_check_interval: 200
-  enable_checkpointing: False
+  enable_checkpointing: True
   log_every_n_steps: 1
-  num_sanity_val_steps: 0
+  num_sanity_val_steps: 1
   num_warmup_steps: 200
-  grad_clip_val: 5
+  grad_clip_val: 0.5
 
 optimizer:
   vit_precision: 'fp16'
   diffusion_precision: 'fp16'
   precision: '32'
-  max_lr: 7e-4
+  max_lr: 5e-6
 
 hyperparameters:
   beta_1: 0.9
   beta_2: 0.999
-  weight_decar: 5e-4
+  weight_decay: 5e-2
+
