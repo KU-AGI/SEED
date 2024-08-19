@@ -1165,10 +1165,10 @@ if __name__ == "__main__":
         raise ValueError("Only checkpoint or finetune")
 
     if cfg.load_weight:
-        wrapper = SEEDTrainingWrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg, strict=False).to(device)
+        wrapper = SEEDTrainingWrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg, strict=False)
         print("Loaded model from checkpoint")
     else:
-        wrapper = SEEDTrainingWrapper(cfg).to(device)
+        wrapper = SEEDTrainingWrapper(cfg)
         if cfg.experiment.stage == 1:
             print(f"Stage 1 init from {cfg.stage1.init}")
         elif cfg.experiment.stage == 2:

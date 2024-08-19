@@ -3,28 +3,28 @@ tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 # transform_cfg_path: configs/transform/clip_transform.yaml
 transform_cfg_path: configs/transform/slot_transform.yaml
 model_cfg_path: configs/llm/seed_llama_8b.yaml 
-result_file_path: ./logs/slot_quantization
+result_file_path: ./logs/slot_diffusion_debug
 # result_file_path: ./logs/seed_slot_layer1
 checkpoint_path:
   model_path: pretrained/seed_tokenizer/seed_quantizer.pt
   diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
-slot_cfg_path: /home/zheedong/Projects/latent-slot-diffusion/configs/coco/slot_attn/config_12heads_dino.json
+slot_cfg_path: configs/slot_attn/config_12heads_dino.json
+# slot_cfg_path: configs/slot_attn/config_12heads_dino_vitg.json
 
 resume: False
 load_weight: True
-weight_path: /home/zheedong/Projects/SEED/logs/slot_stage1_related/seed_slot_layer1_dino_12head_dataaug_learnablequery_200epoch_crossattn_unfreeze/checkpoints/epoch=88-step=122926.ckpt
+# weight_path: pretrained/seed_slot_layer1_dino_12head_dataaug_learnablequery_200epoch_crossattn_unfreeze/checkpoints/epoch=88-step=122926.ckpt
+weight_path: logs/slot_quantization_related/nsvq_train_blocks_image_freeze_unet_linear_8_blocks_512_embed_dim_8192_codebook_dim_4gpus/checkpoints/epoch=74-step=36675.ckpt
 eval: False
 
 dist:
-  n_gpus: 6
+  n_gpus: 1
   n_nodes: 1
 
 dataset:
   train_config:
-    # dataset_configs: ['configs/data/cc15m.yaml', 'configs/data/laion-coco.yaml', 'configs/data/mscoco.yaml']
-    # weights: [1, 6, 4]
-    dataset_configs: ['configs/data/cc15m-total.yaml', 'configs/data/laion-coco.yaml', 'configs/data/mscoco.yaml', 'configs/data/unsplash.yaml']
-    weights: [15, 24, 1, 4]
+    dataset_configs: ['configs/data/cc15m-total.yaml', 'configs/data/laion-coco-total.yaml', 'configs/data/mscoco.yaml', 'configs/data/unsplash.yaml']
+    weights: [15, 100, 4, 1]
     shardshuffle: 100
     resampled: True
     world_size: 1
@@ -40,19 +40,24 @@ dataset:
   text_max_length: 128
 
 stage1:
+  dino_model_name: 'dinov2_vitb14' # ['dinov2_vits14', 'dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14']
+  unfreeze_unet: True
+  image_size: 256 # [256, 512]
+
+stage2:
   loss_weight:
-    loss_codebook: 5
-    loss_recon: 2
-    loss_diffusion: 0.5
+    loss_codebook: 0
+    loss_recon: 1
+    loss_diffusion: 4
   unfreeze_unet: False
   unfreeze_linear: False
-  blocks_layers: 4
-  blocks_image_layers: 12
+  blocks_layers: 8
+  blocks_image_layers: 8
   use_blocks_image: True
   unclip: False
   vq:
-    vq_type: 'vq'
-    codebook_embed_dim: 128
+    vq_type: 'nsvq'
+    codebook_embed_dim: 512
     n_embed: 8192
     replace_codes: True
     replacement_num_batches: 1000
@@ -61,16 +66,16 @@ stage1:
 
 experiment:
   seed: 0
-  stage: 1
-  local_batch_size: 128
+  stage: 2
+  local_batch_size: 16
   val_batch_size: 16
   test_split: train
-  max_epochs: 100
+  max_epochs: 200
   deterministic: False
   grad_accumulation: 2
   val_check_interval: 0.5
   # check_val_every_n_epoch: 1 
-  enable_checkpointing: True
+  enable_checkpointing: False
   log_every_n_steps: 1
   num_sanity_val_steps: 1
   num_warmup_steps: 200
@@ -80,7 +85,7 @@ optimizer:
   vit_precision: 'fp16'
   diffusion_precision: 'fp16'
   precision: '16'
-  max_lr: 1e-4
+  max_lr: 5e-5
 
 hyperparameters:
   beta_1: 0.9

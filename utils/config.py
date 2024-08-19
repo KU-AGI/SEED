@@ -21,8 +21,8 @@ def to_attr_dict(cfg):
     cfg = AttrDict.from_nested_dicts(c)
     return cfg
 
-def build_config(struct=False):
-    cfg = OmegaConf.load('configs/seed_unified_test.yaml')
+def build_config(path="configs/seed_unified_test.yaml", struct=False):
+    cfg = OmegaConf.load(path)
     OmegaConf.set_struct(cfg, struct)
     cfg = override_from_file_name(cfg)
     cfg = override_from_cli(cfg)

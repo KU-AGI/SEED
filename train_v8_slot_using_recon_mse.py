@@ -63,6 +63,8 @@ from diffusers import (
     DiffusionPipeline,
 )
 
+from torchvision.transforms import ToPILImage
+
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 BOI_TOKEN = "<img>"
@@ -73,6 +75,19 @@ IMG_FLAG = "<image>"
 NUM_IMG_TOKNES = 32
 NUM_IMG_CODES = 8192
 IMAGE_ID_SHIFT = 32000
+
+def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
+    """
+    Rescale `noise_cfg` according to `guidance_rescale`. Based on findings of [Common Diffusion Noise Schedules and
+    Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf). See Section 3.4
+    """
+    std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
+    std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
+    # rescale the results from guidance (fixes overexposure)
+    noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
+    # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
+    noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+    return noise_cfg
 
 class GatherLayer(torch.autograd.Function):
     """
@@ -254,6 +269,8 @@ class SlotTrainingWrapper(LightningModule):
                 nn.Linear(codebook_embed_dim, self.slot_size)  # for quantize
             )
 
+            self.to_pil_image = ToPILImage()
+
     def setup(self, stage):
         # Freeze backbone
         for param in self.backbone.parameters():
@@ -272,12 +289,13 @@ class SlotTrainingWrapper(LightningModule):
         for param in self.vae.parameters():
             param.requires_grad = False
 
+        if hasattr(self.cfg.stage2, "unfreeze_unet"):
+            # casting to float32
+            self.unet = self.unet.to(dtype=torch.float32)
+        
         if self.stage == 1:
-            if hasattr(self.cfg.stage1, "unfreeze_unet"):
-                # casting to float32
-                self.unet = self.unet.to(dtype=torch.float32)
             for name, param in self.unet.named_parameters():
-                # If self.cfg.stage1.unfreeze_unet exists, unfreeze cross attention layer
+                # If self.cfg.stage2.unfreeze_unet exists, unfreeze cross attention layer
                 if hasattr(self.cfg.stage1, "unfreeze_unet") and self.cfg.stage1.unfreeze_unet:
                     if any(x in name for x in ["attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out"]):
                         print(f"Unfreeze {name}")
@@ -289,20 +307,6 @@ class SlotTrainingWrapper(LightningModule):
 
         # Freezing for stage 2
         if self.stage == 2:
-            if hasattr(self.cfg.stage2, "unfreeze_unet"):
-                # casting to float32
-                self.unet = self.unet.to(dtype=torch.float32)
-            for name, param in self.unet.named_parameters():
-                # If self.cfg.stage2.unfreeze_unet exists, unfreeze cross attention layer
-                if hasattr(self.cfg.stage2, "unfreeze_unet") and self.cfg.stage2.unfreeze_unet:
-                    if any(x in name for x in ["attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out"]):
-                        print(f"Unfreeze {name}")
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = False
-                else:
-                    param.requires_grad = False
-
             # Freeze slot
             for param in self.slot_attention.parameters():
                 param.requires_grad = False
@@ -460,7 +464,7 @@ class SlotTrainingWrapper(LightningModule):
         loss_diffusion = F.mse_loss(model_pred.float(),
                             target.float(), reduction="mean")
         logging_dict["loss_diffusion"] = loss_diffusion
-        
+
         # loss logging
         cur_stage = "train" if not is_validation else "val"
         for key in logging_dict.keys():
@@ -475,6 +479,221 @@ class SlotTrainingWrapper(LightningModule):
             )
         
         return loss_diffusion, slots, slots_1024
+
+    def diffusion_my_call(
+        self,
+        prompt: Union[str, List[str]] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: int = 1,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        guidance_rescale: float = 0.0,
+    ):
+        r"""
+        The call function to the pipeline for generation.
+
+        Args:
+            prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
+            height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
+                The height in pixels of the generated image.
+            width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
+                The width in pixels of the generated image.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                A higher guidance scale value encourages the model to generate images closely linked to the text
+                `prompt` at the expense of lower image quality. Guidance scale is enabled when `guidance_scale > 1`.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide what to not include in image generation. If not defined, you need to
+                pass `negative_prompt_embeds` instead. Ignored when not using guidance (`guidance_scale < 1`).
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) from the [DDIM](https://arxiv.org/abs/2010.02502) paper. Only applies
+                to the [`~schedulers.DDIMScheduler`], and is ignored in other schedulers.
+            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
+                generation deterministic.
+            latents (`torch.FloatTensor`, *optional*):
+                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor is generated by sampling using the supplied random `generator`.
+            prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
+                provided, text embeddings are generated from the `prompt` input argument.
+            negative_prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated negative text embeddings. Can be used to easily tweak text inputs (prompt weighting). If
+                not provided, `negative_prompt_embeds` are generated from the `negative_prompt` input argument.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generated image. Choose between `PIL.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            callback (`Callable`, *optional*):
+                A function that calls every `callback_steps` steps during inference. The function is called with the
+                following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function is called. If not specified, the callback is called at
+                every step.
+            cross_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the [`AttentionProcessor`] as defined in
+                [`self.processor`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            guidance_rescale (`float`, *optional*, defaults to 0.7):
+                Guidance rescale factor from [Common Diffusion Noise Schedules and Sample Steps are
+                Flawed](https://arxiv.org/pdf/2305.08891.pdf). Guidance rescale factor should fix overexposure when
+                using zero terminal SNR.
+
+        Examples:
+
+        Returns:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+                If `return_dict` is `True`, [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] is returned,
+                otherwise a `tuple` is returned where the first element is a list with the generated images and the
+                second element is a list of `bool`s indicating whether the corresponding generated image contains
+                "not-safe-for-work" (nsfw) content.
+        """
+        # 0. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        # 1. Check inputs. Raise error if not correct
+
+        # 2. Define call parameters
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        device = self.device
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # 3. Encode input prompt
+        text_encoder_lora_scale = (
+            cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
+        )
+        prompt_embeds = self.diffusion_model._encode_prompt(
+            prompt,
+            device,
+            num_images_per_prompt,
+            do_classifier_free_guidance,
+            negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            lora_scale=text_encoder_lora_scale,
+        )
+
+        # 4. Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        # 5. Prepare latent variables
+        num_channels_latents = self.unet.config.in_channels
+        latents = self.diffusion_model.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
+
+        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        extra_step_kwargs = self.diffusion_model.prepare_extra_step_kwargs(generator, eta)
+
+        # 7. Denoising loop
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+        for i, t in enumerate(timesteps):
+            # expand the latents if we are doing classifier free guidance
+            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+            # predict the noise residual
+            noise_pred = self.unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=prompt_embeds,
+                cross_attention_kwargs=cross_attention_kwargs,
+                return_dict=False,
+            )[0]
+
+            # perform guidance
+            if do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+            if do_classifier_free_guidance and guidance_rescale > 0.0:
+                # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+                noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
+
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+            # call the callback, if provided
+            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if callback is not None and i % callback_steps == 0:
+                    callback(i, t, latents)
+
+        image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+
+        return image
+
+
+    def get_diffusion_mse_loss(self, batch, batch_idx: int, is_validation=False):
+        logging_dict = {}
+
+        original_images = self.transform_256(batch[0])
+
+        slots = self.get_slot_embedding(batch, batch_idx)
+
+        slots_1024 = self.out_linear_1024(slots)
+
+        reconstructed_images = self.diffusion_my_call(
+            prompt_embeds=slots_1024,
+            height=self.image_size,
+            width=self.image_size,
+            guidance_scale=0.0,
+            num_inference_steps=10,
+        )
+
+        loss_mse = F.mse_loss(reconstructed_images, original_images)
+        logging_dict["loss_mse"] = loss_mse
+        
+        # loss logging
+        cur_stage = "train" if not is_validation else "val"
+        for key in logging_dict.keys():
+            self.log(
+                f"{cur_stage}/{key}",
+                logging_dict[key],
+                on_step=False if is_validation else True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                sync_dist=True,
+            )
+        
+        return loss_mse, slots, slots_1024
     
     def calculate_rec_loss(self, rec, target):
         target = target / target.norm(dim=-1, keepdim=True)
@@ -494,6 +713,10 @@ class SlotTrainingWrapper(LightningModule):
         uniques = indices.unique().numel()
         return (uniques / num_codes) * 100
 
+    def add_gaussian_noise(self, x, mean=0.0, std=0.1, noise_factor=0.1):
+        noise = torch.randn_like(x) * std + mean
+        return x * (1 - noise_factor) + noise_factor * noise
+
     def get_quantize_loss(self, batch, batch_idx: int, is_validation=False):
         logging_dict = {}
 
@@ -507,7 +730,6 @@ class SlotTrainingWrapper(LightningModule):
         logging_dict["loss_codebook"] = loss_codebook
         logging_dict["sim_32"] = F.cosine_similarity(slots_down, quant, dim=-1).mean()
         logging_dict["perplexity"] = perplexity
-        logging_dict["codebook_util"] = self.get_codebook_util(embed_ind)
         
         # Flatten the quantized slots
         embed_ind = embed_ind.reshape(slots.shape[0], -1)
@@ -515,7 +737,7 @@ class SlotTrainingWrapper(LightningModule):
         # codebook replacement
         replacement_num_batches = self.cfg.stage2.vq.replacement_num_batches
         #if ((self.global_step + 1) % replacement_num_batches == 0) & (self.global_step <= replacement_num_batches - 2 * replacement_num_batches):
-        if ((batch_idx + 1) % replacement_num_batches == 0) and self.cfg.stage2.vq.replace_codes:
+        if ((batch_idx + 1) % replacement_num_batches == 0) & self.cfg.stage2.vq.replace_codes:
             num_replaced_codebook = self.quantize.replace_unused_codebooks(replacement_num_batches)
         else:
             num_replaced_codebook = -1
@@ -523,37 +745,20 @@ class SlotTrainingWrapper(LightningModule):
         # [b, 32, 32] => [b, 32, 768]
         slots_up_768 = self.decode_task_layer(quant)
 
+        # Apply transformer blocks
+        slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
+        
+        loss_recon = self.calculate_rec_loss(slots_up_768_blocks_applied, slots)
+        logging_dict["loss_recon"] = loss_recon
+        logging_dict["sim_768"] = F.cosine_similarity(slots_up_768_blocks_applied, slots, dim=-1).mean()
+
         # [b, 32, 768] => [b, 32, 1024]
         if self.cfg.stage2.use_blocks_image:
-            # Apply transformer blocks
-            slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
-            
-            loss_recon = self.calculate_rec_loss(slots_up_768_blocks_applied, slots)
-            logging_dict["loss_recon"] = loss_recon
-            logging_dict["sim_768"] = F.cosine_similarity(slots_up_768_blocks_applied, slots, dim=-1).mean()
             # Separate transformer blocks for image
             slots_up_768_blocks_image_applied = self.apply_transformer(slots_up_768, self.blocks_image)
             slots_1024 = self.out_linear_1024(slots_up_768_blocks_image_applied)
-
         else:
-            recon_debug = True
-            if recon_debug:
-                # Recon loss before transformer
-                loss_recon = self.calculate_rec_loss(slots_up_768, slots)
-                logging_dict["loss_recon"] = loss_recon
-                logging_dict["sim_768"] = F.cosine_similarity(slots_up_768, slots, dim=-1).mean()
-
-                # Apply transformer blocks
-                slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
-                slots_1024 = self.out_linear_1024(slots_up_768_blocks_applied)
-            else:
-                # Apply transformer blocks
-                slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
-                
-                loss_recon = self.calculate_rec_loss(slots_up_768_blocks_applied, slots)
-                logging_dict["loss_recon"] = loss_recon
-                logging_dict["sim_768"] = F.cosine_similarity(slots_up_768_blocks_applied, slots, dim=-1).mean()
-                slots_1024 = self.out_linear_1024(slots_up_768_blocks_applied)
+            slots_1024 = self.out_linear_1024(slots_up_768_blocks_applied)
 
         # Compute diffusion loss
         noisy_model_input, noise, timesteps, model_input = self.get_diffusion_noisy_model_input(batch)
@@ -622,7 +827,8 @@ class SlotTrainingWrapper(LightningModule):
         self.B = image.shape[0]
 
         if self.stage == 1:
-            loss, *_ = self.get_diffusion_loss(batch, batch_idx)
+            # loss, *_ = self.get_diffusion_loss(batch, batch_idx)
+            loss, *_ = self.get_diffusion_mse_loss(batch, batch_idx)
         elif self.stage == 2:
             loss, *_ = self.get_quantize_loss(batch, batch_idx)
         
@@ -680,7 +886,8 @@ class SlotTrainingWrapper(LightningModule):
 
         img, text, image_id = batch
         if self.stage == 1:
-            _, _, slots_1024 = self.get_diffusion_loss(batch, batch_idx, is_validation=True)
+            # _, _, slots_1024 = self.get_diffusion_loss(batch, batch_idx, is_validation=True)
+            _, _, slots_1024 = self.get_diffusion_mse_loss(batch, batch_idx, is_validation=True)
         else:
             _, _, slots_1024 = self.get_quantize_loss(batch, batch_idx, is_validation=True)
 
@@ -767,7 +974,8 @@ class SlotTrainingWrapper(LightningModule):
             {"params": p_non_wd, "weight_decay": 0},
         ]
 
-        optimizer = torch.optim.AdamW(
+        # optimizer = torch.optim.AdamW(
+        optimizer = torch.optim.Adam(
             optim_params,
             lr=lr,
             betas=betas,
@@ -821,18 +1029,11 @@ if __name__ == "__main__":
         save_last=True,
     )
 
-    if not cfg.experiment.enable_checkpointing:
-        print("############### WARNING: Checkpointing is disabled ###############")
-
-    strategy = DDPStrategy(
-        find_unused_parameters=cfg.experiment.find_unused_parameters,
-    )
-
     trainer = pl.Trainer(
         accelerator=device,
         num_nodes=cfg.dist.n_nodes,
         devices=cfg.dist.n_gpus,
-        strategy=strategy,
+        strategy="ddp",
         max_epochs=cfg.experiment.max_epochs,
         deterministic=cfg.experiment.deterministic,
         logger=tb_logger,

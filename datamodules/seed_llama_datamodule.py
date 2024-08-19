@@ -272,14 +272,13 @@ class SEEDDataModule(pl.LightningDataModule):
         )
 
         if self.use_coco_val:
-            end_index = self.cfg.dataset.val_config.end_index if self.cfg.dataset.val_config.end_index is not None else None
             self.validation_dataset = CocoDataset(
                 root_dir=self.cfg.dataset.val_config.root_dir,
                 karpathy_file=self.cfg.dataset.val_config.karpathy_file_path,
                 transform=self.transform,
                 tokenizer=None,
                 start_index=self.cfg.dataset.val_config.start_index,
-                end_index=end_index,
+                end_index=self.cfg.dataset.val_config.end_index,
             )
         else:
             self.val_one_epoch_data_size = self.cfg.dataset.val_config.one_epoch_data_size
@@ -309,6 +308,7 @@ class SEEDDataModule(pl.LightningDataModule):
             self.train_dataset,
             batch_size=self.local_batch_size,
             num_workers=self.num_workers,
+            pin_memory=False,
         )
 
     def val_dataloader(self):
@@ -318,6 +318,7 @@ class SEEDDataModule(pl.LightningDataModule):
                 batch_size=self.val_batch_size,
                 collate_fn=self.validation_dataset.collate_fn,
                 num_workers=self.num_workers,
+                pin_memory=False,
             )
         else:
             return DataLoader(

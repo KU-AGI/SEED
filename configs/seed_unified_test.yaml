@@ -9,11 +9,11 @@ checkpoint_path:
 
 resume: False
 load_weight: False
-weight_path: None
+weight_path:
 eval: False
 
 dist:
-  n_gpus: 2
+  n_gpus: 1
   n_nodes: 1
 
 dataset:
@@ -28,7 +28,8 @@ dataset:
     karpathy_file_path: /ssd0/data/coco/annotations/karpathy/dataset_coco_test.json
     root_dir: /ssd0/data/coco/images/val2014
     start_index: 0
-    end_index: None
+    end_index:
+    use_coco_val: True
   num_workers: 16
   shuffle: True
   text_max_length: 128
@@ -44,12 +45,18 @@ stage2:
     replace_codes: True
     replacement_num_batches: 1000
     discarding_threshold: 0.01
+    legacy: False
+  loss_weight:
+    loss_codebook: 5
+    loss_recon: 2
+    loss_generation_embedding: 0.5
+  recon_s: True
 
 experiment:
   seed: 0
   stage: 2
-  local_batch_size: 1024
-  val_batch_size: 2
+  local_batch_size: 256
+  val_batch_size: 20
   test_split: train
   max_epochs: 40
   deterministic: False
@@ -57,7 +64,7 @@ experiment:
   check_val_every_n_epoch: 1
   enable_checkpointing: True
   log_every_n_steps: 1
-  num_sanity_val_steps: 1
+  num_sanity_val_steps: 4
   num_warmup_steps: 200
   grad_clip_val: 0.5
 

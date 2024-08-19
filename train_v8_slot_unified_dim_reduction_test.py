@@ -187,8 +187,31 @@ class SlotTrainingWrapper(LightningModule):
         dinov2 = torch.hub.load("facebookresearch/dinov2", cfg.stage1.dino_model_name)
         self.backbone = DINOBackbone(dinov2).eval()
 
-        if self.stage == 2:
-            self.pos_embed = nn.Parameter(torch.zeros(1, 32, self.slot_size))
+        codebook_embed_dim = self.cfg.stage2.vq.codebook_embed_dim
+        n_embed = self.cfg.stage2.vq.n_embed
+
+        print(f"n_embed: {n_embed}, codebook_embed_dim: {codebook_embed_dim}")
+
+        # 768 => codebook_embed_dim
+        self.encode_task_layer = nn.Sequential(
+            nn.Linear(self.slot_size, self.slot_size),
+            nn.Tanh(),
+            nn.Linear(self.slot_size, codebook_embed_dim)  # for quantize
+        )
+
+        # codebook_embed_dim => 768
+        self.decode_task_layer = nn.Sequential(
+            nn.Linear(codebook_embed_dim, codebook_embed_dim),
+            nn.Tanh(),
+            nn.Linear(codebook_embed_dim, self.slot_size)  # for quantize
+        )
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, 32, self.slot_size))
+        if self.cfg.stage2.blocks_layers is None:
+            print("No blocks")
+            self.blocks = None
+            self.blocks_image = None
+        else:
             self.blocks = nn.ModuleList([
                 Block(dim=self.slot_size,
                         num_heads=12,
@@ -213,45 +236,45 @@ class SlotTrainingWrapper(LightningModule):
                             norm_layer=partial(nn.LayerNorm, eps=1e-6)) for _ in range(self.cfg.stage2.blocks_image_layers)
                 ])
 
-            codebook_embed_dim = self.cfg.stage2.vq.codebook_embed_dim
-            n_embed = self.cfg.stage2.vq.n_embed
-
-            print(f"n_embed: {n_embed}, codebook_embed_dim: {codebook_embed_dim}")
-
-            if hasattr(self.cfg.stage2.vq, "vq_type") and self.cfg.stage2.vq.vq_type == "nsvq":
-                print("Using NSVQ")
-                self.quantize = NSVQ(
-                    n_e=n_embed,
-                    e_dim=codebook_embed_dim,
-                    beta=0.25,
-                    remap=None,
-                    sane_index_shape=False,
-                    legacy=False,
-                    discarding_threshold=0.01,
-                )
-            else:
-                self.quantize = VectorQuantizer2(
-                    n_e=n_embed,
-                    e_dim=codebook_embed_dim,
-                    beta=0.25,
-                    remap=None,
-                    sane_index_shape=False,
-                    legacy=False,
-                    discarding_threshold=0.01,
-                )
-            
-            # 768 => codebook_embed_dim
-            self.encode_task_layer = nn.Sequential(
-                nn.Linear(self.slot_size, self.slot_size),
-                nn.Tanh(),
-                nn.Linear(self.slot_size, codebook_embed_dim)  # for quantize
+        if hasattr(self.cfg.stage2.vq, "vq_type") and self.cfg.stage2.vq.vq_type == "nsvq":
+            print("Using NSVQ")
+            self.quantize = NSVQ(
+                n_e=n_embed,
+                e_dim=codebook_embed_dim,
+                beta=0.25,
+                remap=None,
+                sane_index_shape=False,
+                legacy=False,
+                discarding_threshold=0.01,
             )
-
-            # codebook_embed_dim => 768
-            self.decode_task_layer = nn.Sequential(
-                nn.Linear(codebook_embed_dim, codebook_embed_dim),
-                nn.Tanh(),
-                nn.Linear(codebook_embed_dim, self.slot_size)  # for quantize
+        elif self.cfg.stage2.vq.vq_type == "vq_pytorch":
+            from vector_quantize_pytorch import VectorQuantize
+            self.quantize = VectorQuantize(
+                dim=codebook_embed_dim,
+                codebook_size=n_embed,
+                use_cosine_sim=True,
+                threshold_ema_dead_code=2,
+                orthogonal_reg_weight=10,
+                orthogonal_reg_max_codes=128,
+                orthogonal_reg_active_codes_only=True,
+            )
+        elif self.cfg.stage2.vq.vq_type == "lfq":
+            from vector_quantize_pytorch import LFQ
+            self.quantize = LFQ(
+                codebook_size=n_embed,
+                dim=codebook_embed_dim,
+                entropy_loss_weight=0.1,
+                diversity_gamma=1.
+            )
+        else:
+            self.quantize = VectorQuantizer2(
+                n_e=n_embed,
+                e_dim=codebook_embed_dim,
+                beta=0.25,
+                remap=None,
+                sane_index_shape=False,
+                legacy=False,
+                discarding_threshold=0.01,
             )
 
     def setup(self, stage):
@@ -272,54 +295,19 @@ class SlotTrainingWrapper(LightningModule):
         for param in self.vae.parameters():
             param.requires_grad = False
 
-        if self.stage == 1:
-            if hasattr(self.cfg.stage1, "unfreeze_unet"):
-                # casting to float32
-                self.unet = self.unet.to(dtype=torch.float32)
-            for name, param in self.unet.named_parameters():
-                # If self.cfg.stage1.unfreeze_unet exists, unfreeze cross attention layer
-                if hasattr(self.cfg.stage1, "unfreeze_unet") and self.cfg.stage1.unfreeze_unet:
-                    if any(x in name for x in ["attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out"]):
-                        print(f"Unfreeze {name}")
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = False
+        if hasattr(self.cfg.stage1, "unfreeze_unet"):
+            # casting to float32
+            self.unet = self.unet.to(dtype=torch.float32)
+        for name, param in self.unet.named_parameters():
+            # If self.cfg.stage1.unfreeze_unet exists, unfreeze cross attention layer
+            if hasattr(self.cfg.stage1, "unfreeze_unet") and self.cfg.stage1.unfreeze_unet:
+                if any(x in name for x in ["attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out"]):
+                    print(f"Unfreeze {name}")
+                    param.requires_grad = True
                 else:
                     param.requires_grad = False
-
-        # Freezing for stage 2
-        if self.stage == 2:
-            if hasattr(self.cfg.stage2, "unfreeze_unet"):
-                # casting to float32
-                self.unet = self.unet.to(dtype=torch.float32)
-            for name, param in self.unet.named_parameters():
-                # If self.cfg.stage2.unfreeze_unet exists, unfreeze cross attention layer
-                if hasattr(self.cfg.stage2, "unfreeze_unet") and self.cfg.stage2.unfreeze_unet:
-                    if any(x in name for x in ["attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out"]):
-                        print(f"Unfreeze {name}")
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = False
-                else:
-                    param.requires_grad = False
-
-            # Freeze slot
-            for param in self.slot_attention.parameters():
-                param.requires_grad = False
-
-            # Allow to train the out layer norm and out linear
-            if hasattr(self.cfg.stage2, "unfreeze_linear") and \
-                self.cfg.stage2.unfreeze_linear:
-
-                for param in self.slot_attention.out_layer_norm.parameters():
-                    param.requires_grad = True
-                for param in self.out_linear_1024.parameters():
-                    param.requires_grad = True
             else:
-                for param in self.slot_attention.out_layer_norm.parameters():
-                    param.requires_grad = False
-                for param in self.out_linear_1024.parameters():
-                    param.requires_grad = False
+                param.requires_grad = False
 
         ## make dump folder
         os.makedirs(self.cfg.result_file_path, exist_ok=True)
@@ -439,7 +427,12 @@ class SlotTrainingWrapper(LightningModule):
 
         slots = self.get_slot_embedding(batch, batch_idx)
 
-        slots_1024 = self.out_linear_1024(slots)
+        # Debug : apply dim reduction
+        slots_down = self.encode_task_layer(slots)
+        slots_up = self.decode_task_layer(slots_down)
+        slots_1024 = self.out_linear_1024(slots_up)
+
+        # slots_1024 = self.out_linear_1024(slots)
 
         # Predict the noise residual
         model_pred = self.unet(
@@ -489,71 +482,169 @@ class SlotTrainingWrapper(LightningModule):
             pos_embed_applied_slot = blk(pos_embed_applied_slot, use_causal_mask=False)
         return pos_embed_applied_slot
 
-    def get_codebook_util(self, indices):
-        num_codes = self.quantize.n_e
-        uniques = indices.unique().numel()
-        return (uniques / num_codes) * 100
+    def calculate_perplexity(self, quant, embed_ind):
+        b = quant.view(-1, self.quantize.dim).shape[0]
+        flatten_ind = embed_ind.view(-1)
+        encoding = torch.zeros(b, self.quantize.codebook_size, device=self.device)
+        encoding.scatter_(1, flatten_ind.reshape([-1, 1]), 1)
+        avg_probs = torch.mean(encoding, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-12)))
+        return perplexity
+
+    def get_quantize_loss_wo_blocks(self, batch, batch_idx: int, is_validation=False):
+        logging_dict = {}
+
+        slots = self.get_slot_embedding(batch, batch_idx)
+        
+        # [b, 32, 768] => [b, 32, 32]
+        slots_down = self.encode_task_layer(slots)
+
+        if self.cfg.stage2.bypass_codebook:
+            quant, embed_ind, loss_codebook = slots_down, None, 0
+        else:
+            quant, embed_ind, loss_codebook = self.quantize(slots_down)
+            perplexity = None
+            logging_dict["sim_quant_and_quant_inference"] = \
+                F.cosine_similarity(quant, self.quantize.indices_to_codes(embed_ind), dim=-1).mean()
+
+            logging_dict["loss_codebook"] = loss_codebook
+            logging_dict["sim_32"] = F.cosine_similarity(slots_down, quant, dim=-1).mean()
+            
+            if perplexity is not None:
+                logging_dict["perplexity"] = perplexity
+            
+        # [b, 32, 32] => [b, 32, 768]
+        slots_up_768 = self.decode_task_layer(quant)
+
+        # Reconstruction loss without transformer blocks
+        loss_recon = self.calculate_rec_loss(slots_up_768, slots)
+        logging_dict["loss_recon"] = loss_recon
+        logging_dict["sim_768"] = F.cosine_similarity(slots_up_768, slots, dim=-1).mean()
+
+        slots_1024 = self.out_linear_1024(slots_up_768)
+
+        # Compute diffusion loss
+        noisy_model_input, noise, timesteps, model_input = self.get_diffusion_noisy_model_input(batch)
+
+        model_pred = self.unet(
+            noisy_model_input, timesteps, slots_1024,
+        ).sample
+
+                # Get the target for loss depending on the prediction type
+        if self.scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif self.scheduler.config.prediction_type == "v_prediction":
+            target = self.scheduler.get_velocity(
+                model_input, noise, timesteps)
+        else:
+            raise ValueError(
+                f"Unknown prediction type {self.scheduler.config.prediction_type}")
+
+        # Compute instance loss
+        loss_diffusion = F.mse_loss(model_pred.float(),
+                            target.float(), reduction="mean")
+        logging_dict["loss_diffusion"] = loss_diffusion
+
+        # Combine loss
+        if hasattr(self.cfg.stage2.vq, "vq_type") and self.cfg.stage2.vq.vq_type == "nsvq":
+            # Don't use codebook loss when using nsvq
+            loss = self.cfg.stage2.loss_weight.loss_recon * loss_recon + \
+                    self.cfg.stage2.loss_weight.loss_diffusion * loss_diffusion
+        else:
+            loss = self.cfg.stage2.loss_weight.loss_codebook * loss_codebook + \
+                    self.cfg.stage2.loss_weight.loss_recon * loss_recon + \
+                    self.cfg.stage2.loss_weight.loss_diffusion * loss_diffusion
+        logging_dict["loss"] = loss
+
+        # loss logging
+        cur_stage = "train" if not is_validation else "val"
+        for key in logging_dict.keys():
+            self.log(
+                f"{cur_stage}/{key}",
+                logging_dict[key],
+                on_step=False if is_validation else True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                sync_dist=True,
+            )
+
+        return loss, slots_up_768, slots_1024
+
 
     def get_quantize_loss(self, batch, batch_idx: int, is_validation=False):
         logging_dict = {}
 
-        with torch.no_grad():
-            slots = self.get_slot_embedding(batch, batch_idx)
+        slots = self.get_slot_embedding(batch, batch_idx)
 
         # [b, 32, 768] => [b, 32, 32]
         slots_down = self.encode_task_layer(slots)
-        
-        quant, loss_codebook, embed_ind, perplexity = self.quantize(slots_down)
+
+        if self.cfg.stage2.vq.vq_type == "vq_pytorch":
+            quant, embed_ind, loss_codebook = self.quantize(slots_down)
+            perplexity = self.calculate_perplexity(quant, embed_ind)
+            logging_dict["sim_quant_and_quant_inference"] = \
+                F.cosine_similarity(quant, self.quantize.get_codes_from_indices(embed_ind), dim=-1).mean()
+
+            # Generate by using the indices
+            if is_validation:
+                self.print(f"Current indices: {embed_ind[0]}")
+                quant = self.quantize.get_codes_from_indices(embed_ind)
+        elif self.cfg.stage2.vq.vq_type == "lfq":
+            quant, embed_ind, loss_codebook = self.quantize(slots_down)
+            perplexity = None
+
+            logging_dict["sim_quant_and_quant_inference"] = \
+                F.cosine_similarity(quant, self.quantize.indices_to_codes(embed_ind), dim=-1).mean()
+
+            # Generate by using the indices
+            if is_validation:
+                self.print(f"Current indices: {embed_ind[0]}")
+                quant = self.quantize.indices_to_codes(embed_ind)
+        else:
+            quant, loss_codebook, embed_ind, perplexity = self.quantize(slots_down)
+
+            # Flatten the quantized slots
+            embed_ind = embed_ind.reshape(slots.shape[0], -1)
+
+            # codebook replacement
+            replacement_num_batches = self.cfg.stage2.vq.replacement_num_batches
+            #if ((self.global_step + 1) % replacement_num_batches == 0) & (self.global_step <= replacement_num_batches - 2 * replacement_num_batches):
+            if ((batch_idx + 1) % replacement_num_batches == 0) & self.cfg.stage2.vq.replace_codes:
+                num_replaced_codebook = self.quantize.replace_unused_codebooks(replacement_num_batches)
+            else:
+                num_replaced_codebook = -1
+                logging_dict["sim_quant_and_quant_inference"] = \
+                    F.cosine_similarity(quant, self.quantize.get_codebook_entry(embed_ind), dim=-1).mean()
+
+            # Generate by using the indices
+            if is_validation:
+                self.print(f"Current indices: {embed_ind[0]}")
+                quant = self.quantize.get_codebook_entry(embed_ind)
+
         logging_dict["loss_codebook"] = loss_codebook
         logging_dict["sim_32"] = F.cosine_similarity(slots_down, quant, dim=-1).mean()
-        logging_dict["perplexity"] = perplexity
-        logging_dict["codebook_util"] = self.get_codebook_util(embed_ind)
+
+        if perplexity is not None:
+            logging_dict["perplexity"] = perplexity
         
-        # Flatten the quantized slots
-        embed_ind = embed_ind.reshape(slots.shape[0], -1)
-
-        # codebook replacement
-        replacement_num_batches = self.cfg.stage2.vq.replacement_num_batches
-        #if ((self.global_step + 1) % replacement_num_batches == 0) & (self.global_step <= replacement_num_batches - 2 * replacement_num_batches):
-        if ((batch_idx + 1) % replacement_num_batches == 0) and self.cfg.stage2.vq.replace_codes:
-            num_replaced_codebook = self.quantize.replace_unused_codebooks(replacement_num_batches)
-        else:
-            num_replaced_codebook = -1
-
         # [b, 32, 32] => [b, 32, 768]
         slots_up_768 = self.decode_task_layer(quant)
 
+        # Apply transformer blocks
+        slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
+        
+        loss_recon = self.calculate_rec_loss(slots_up_768_blocks_applied, slots)
+        logging_dict["loss_recon"] = loss_recon
+        logging_dict["sim_768"] = F.cosine_similarity(slots_up_768_blocks_applied, slots, dim=-1).mean()
+
         # [b, 32, 768] => [b, 32, 1024]
         if self.cfg.stage2.use_blocks_image:
-            # Apply transformer blocks
-            slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
-            
-            loss_recon = self.calculate_rec_loss(slots_up_768_blocks_applied, slots)
-            logging_dict["loss_recon"] = loss_recon
-            logging_dict["sim_768"] = F.cosine_similarity(slots_up_768_blocks_applied, slots, dim=-1).mean()
             # Separate transformer blocks for image
             slots_up_768_blocks_image_applied = self.apply_transformer(slots_up_768, self.blocks_image)
             slots_1024 = self.out_linear_1024(slots_up_768_blocks_image_applied)
-
         else:
-            recon_debug = True
-            if recon_debug:
-                # Recon loss before transformer
-                loss_recon = self.calculate_rec_loss(slots_up_768, slots)
-                logging_dict["loss_recon"] = loss_recon
-                logging_dict["sim_768"] = F.cosine_similarity(slots_up_768, slots, dim=-1).mean()
-
-                # Apply transformer blocks
-                slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
-                slots_1024 = self.out_linear_1024(slots_up_768_blocks_applied)
-            else:
-                # Apply transformer blocks
-                slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
-                
-                loss_recon = self.calculate_rec_loss(slots_up_768_blocks_applied, slots)
-                logging_dict["loss_recon"] = loss_recon
-                logging_dict["sim_768"] = F.cosine_similarity(slots_up_768_blocks_applied, slots, dim=-1).mean()
-                slots_1024 = self.out_linear_1024(slots_up_768_blocks_applied)
+            slots_1024 = self.out_linear_1024(slots_up_768_blocks_applied)
 
         # Compute diffusion loss
         noisy_model_input, noise, timesteps, model_input = self.get_diffusion_noisy_model_input(batch)
@@ -580,7 +671,7 @@ class SlotTrainingWrapper(LightningModule):
         logging_dict["loss_diffusion"] = loss_diffusion
 
         # Combine loss
-        if hasattr(self.cfg.stage2, "vq_type") and self.cfg.stage2.vq_type == "nsvq":
+        if hasattr(self.cfg.stage2.vq, "vq_type") and self.cfg.stage2.vq.vq_type == "nsvq":
             # Don't use codebook loss when using nsvq
             loss = self.cfg.stage2.loss_weight.loss_recon * loss_recon + \
                     self.cfg.stage2.loss_weight.loss_diffusion * loss_diffusion
@@ -621,9 +712,9 @@ class SlotTrainingWrapper(LightningModule):
 
         self.B = image.shape[0]
 
-        if self.stage == 1:
-            loss, *_ = self.get_diffusion_loss(batch, batch_idx)
-        elif self.stage == 2:
+        if self.blocks is None:
+            loss, *_ = self.get_quantize_loss_wo_blocks(batch, batch_idx)
+        else:
             loss, *_ = self.get_quantize_loss(batch, batch_idx)
         
         return loss
@@ -653,7 +744,7 @@ class SlotTrainingWrapper(LightningModule):
                 norm_out_linear_1024[norm],
                 global_step=self.global_step,
             )
-        if hasattr(self, "blocks"):
+        if hasattr(self, "blocks") and self.blocks is not None:
             norm_blocks = grad_norm(self.blocks, norm_type=2)
             for norm in norm_blocks.keys():
                 self.logger.experiment.add_scalar(
@@ -679,8 +770,10 @@ class SlotTrainingWrapper(LightningModule):
         os.makedirs(self.save_path, exist_ok=True)
 
         img, text, image_id = batch
-        if self.stage == 1:
-            _, _, slots_1024 = self.get_diffusion_loss(batch, batch_idx, is_validation=True)
+
+        if self.blocks is None:
+            self.print("Use quantize loss without blocks")
+            _, _, slots_1024 = self.get_quantize_loss_wo_blocks(batch, batch_idx, is_validation=True)
         else:
             _, _, slots_1024 = self.get_quantize_loss(batch, batch_idx, is_validation=True)
 

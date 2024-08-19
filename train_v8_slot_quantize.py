@@ -36,7 +36,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from models.seed_qformer.vit import Block
-from models.seed_llama_tokenizer import ImageTokenizer
 
 from datamodules.seed_llama_datamodule import SEEDDataModule
 
@@ -50,9 +49,6 @@ from diffusers import DPMSolverMultistepScheduler
 
 from models.slot_attention.slot_attn import MultiHeadSTEVESA
 from models.seed_qformer.qformer_quantizer import VectorQuantizer2, NSVQ
-
-from scipy.optimize import linear_sum_assignment
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from diffusers import (
     DiffusionPipeline,
@@ -483,6 +479,11 @@ class SlotTrainingWrapper(LightningModule):
             pos_embed_applied_slot = blk(pos_embed_applied_slot, use_causal_mask=False)
         return pos_embed_applied_slot
 
+    def get_codebook_util(self, indices):
+        num_codes = self.quantize.n_e
+        uniques = indices.unique().numel()
+        return (uniques / num_codes) * 100
+
     def get_quantize_loss(self, batch, batch_idx: int, is_validation=False):
         logging_dict = {}
 
@@ -496,6 +497,7 @@ class SlotTrainingWrapper(LightningModule):
         logging_dict["loss_codebook"] = loss_codebook
         logging_dict["sim_32"] = F.cosine_similarity(slots_down, quant, dim=-1).mean()
         logging_dict["perplexity"] = perplexity
+        logging_dict["codebook_util"] = self.get_codebook_util(embed_ind)
         
         # Flatten the quantized slots
         embed_ind = embed_ind.reshape(slots.shape[0], -1)
@@ -518,13 +520,27 @@ class SlotTrainingWrapper(LightningModule):
         logging_dict["loss_recon"] = loss_recon
         logging_dict["sim_768"] = F.cosine_similarity(slots_up_768_blocks_applied, slots, dim=-1).mean()
 
-        # [b, 32, 768] => [b, 32, 1024]
-        if self.cfg.stage1.use_blocks_image:
-            # Separate transformer blocks for image
-            slots_up_768_blocks_image_applied = self.apply_transformer(slots_up_768, self.blocks_image)
-            slots_1024 = self.out_linear_1024(slots_up_768_blocks_image_applied)
+        debug = True
+
+        if debug:
+            # Debug
+            quant_inference = self.quantize.get_codebook_entry(embed_ind)
+            logging_dict["sim_quant_and_quant_inference"] = F.cosine_similarity(quant, quant_inference, dim=-1).mean()
+
+            slots_up_768_generation = self.decode_task_layer(quant_inference)
+            if self.cfg.stage1.use_blocks_image:
+                slots_up_768_blocks_image_applied_generation = self.apply_transformer(slots_up_768_generation, self.blocks_image)
+                slots_1024 = self.out_linear_1024(slots_up_768_blocks_image_applied_generation)
+            else:
+                slots_1024 = self.out_linear_1024(slots_up_768_generation)
         else:
-            slots_1024 = self.out_linear_1024(slots_up_768_blocks_applied)
+            # [b, 32, 768] => [b, 32, 1024]
+            if self.cfg.stage1.use_blocks_image:
+                # Separate transformer blocks for image
+                slots_up_768_blocks_image_applied = self.apply_transformer(slots_up_768, self.blocks_image)
+                slots_1024 = self.out_linear_1024(slots_up_768_blocks_image_applied)
+            else:
+                slots_1024 = self.out_linear_1024(slots_up_768_blocks_applied)
 
         # Compute diffusion loss
         noisy_model_input, noise, timesteps, model_input = self.get_diffusion_noisy_model_input(batch)
@@ -551,7 +567,7 @@ class SlotTrainingWrapper(LightningModule):
         logging_dict["loss_diffusion"] = loss_diffusion
 
         # Combine loss
-        if hasattr(self.cfg.stage1, "vq_type") and self.cfg.stage1.vq_type == "nsvq":
+        if hasattr(self.cfg.stage1.vq, "vq_type") and self.cfg.stage1.vq.vq_type == "nsvq":
             # Don't use codebook loss when using nsvq
             loss = self.cfg.stage1.loss_weight.loss_recon * loss_recon + \
                     self.cfg.stage1.loss_weight.loss_diffusion * loss_diffusion
@@ -575,6 +591,7 @@ class SlotTrainingWrapper(LightningModule):
             )
 
         return loss, slots_up_768_blocks_applied, slots_1024
+
 
     def on_train_start(self):
         self.print(f"\n====Traing Stage {self.stage}====")
@@ -810,9 +827,9 @@ if __name__ == "__main__":
         raise ValueError("Only checkpoint or finetune")
 
     if cfg.load_weight:
-        wrapper = SlotTrainingWrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg, strict=False).to(device)
+        wrapper = SlotTrainingWrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg, strict=False)
     else:
-        wrapper = SlotTrainingWrapper(cfg).to(device)
+        wrapper = SlotTrainingWrapper(cfg)
         if cfg.experiment.stage == 1:
             print(f"Stage 1 init from {cfg.stage1.init}")
         elif cfg.experiment.stage == 2:
