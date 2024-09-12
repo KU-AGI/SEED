@@ -1,0 +1,4 @@
+META:
+  - ["/ssd0/data/cc3m/{00000..00331}_filtered.tar", 3000000]
+    
+MAX_WORDS: 160

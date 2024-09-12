@@ -50,7 +50,10 @@ from einops import rearrange, einsum
 #torch.set_printoptions(profile="full")
 logger = logging.get_logger(__name__)
 
-slot_attention_layers = [3, 5, 7]
+# TODO: slot attention layers are hard coded here
+# slot_attention_layers = [0, 2, 4, 6, 8, 10]
+slot_attention_layers = [6, 8, 10]
+print(f"Slot attention layers are hard coded here: {slot_attention_layers}")
 
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word and position embeddings."""
@@ -274,7 +277,8 @@ class BertSelfAttention(nn.Module):
 
             # TODO : to config
             T = 1
-            num_iterations = 5 
+            num_iterations = 3
+            # num_iterations = 5
             # num_iterations = 50
             attns_collect = []
             slots_collect = []
@@ -497,8 +501,10 @@ class BertLayer(nn.Module):
             self.crossattention = BertAttention(config, is_cross_attention=self.config.add_cross_attention)
             self.has_cross_attention = True
         elif self.layer_num in slot_attention_layers:
-            self.crossattention = BertAttention(config, is_cross_attention=self.config.add_cross_attention)
-            self.has_cross_attention = True
+            # Add slot attention layers if the layer number is in the slot_attention_layers
+            if not self.has_cross_attention:
+                self.crossattention = BertAttention(config, is_cross_attention=self.config.add_cross_attention)
+                self.has_cross_attention = True
         else:
             self.has_cross_attention = False
         self.intermediate = BertIntermediate(config)

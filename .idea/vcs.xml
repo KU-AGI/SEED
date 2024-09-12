@@ -2,5 +2,8 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/LAVIS" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/data/CapsFusion-120M" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/my-vector-quantize-pytorch" vcs="Git" />
   </component>
 </project>

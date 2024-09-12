@@ -23,8 +23,8 @@ dist:
 
 dataset:
   train_config:
-    dataset_configs: ['configs/data/cc15m.yaml']
-    weights: [1]
+    dataset_configs: ['configs/data/cc15m-total.yaml', 'configs/data/laion-coco-total.yaml', 'configs/data/mscoco.yaml', 'configs/data/unsplash.yaml']
+    weights: [15, 660, 1, 4]
     shardshuffle: 100
     resampled: True
     world_size: 1

@@ -48,9 +48,11 @@ class ImageTokenizer(nn.Module):
         super().__init__()
         from .seed_qformer.qformer_quantizer import Blip2QformerQuantizer
         if not from_pretrained:
+            print(f"$$ Warning: Loading model from scratch")
             model = Blip2QformerQuantizer(vit_precision=vit_precision, is_train=True, **kwargs)
+            model.load_from_pretrained("")
         else:
-            print(f"Loading model from {model_path}, SEED Weight")
+            print(f"Loading model from {model_path}")
             model = Blip2QformerQuantizer.from_pretrained(pretrained_model_path=model_path,
                                                         #vit_precision='fp16' if fp16 else 'fp32',
                                                         vit_precision=vit_precision,
