@@ -21,5 +21,7 @@ logs_old/*
 datamodules/cc3m_index.json
 legacy/eval_legacy/evaluation/pycocoevalcap/*
 data/long_caption_dataset/*
+data/dino_test/*
+.DS_Store
 test/*
 ```
