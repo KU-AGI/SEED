@@ -1,8 +1,9 @@
 cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 # transform_cfg_path: configs/transform/clip_transform.yaml
-transform_cfg_path: configs/transform/slot_transform_224.yaml
-model_cfg_path: configs/llm/seed_llama_8b.yaml 
+#transform_cfg_path: configs/transform/slot_transform_224.yaml
+transform_cfg_path: configs/transform/slot_transform.yaml
+model_cfg_path: configs/llm/seed_llama_8b.yaml
 result_file_path: ./logs/slot_diffusion
 # result_file_path: ./logs/seed_slot_layer1
 checkpoint_path:
@@ -21,8 +22,8 @@ dist:
 
 dataset:
   train_config:
-    dataset_configs: [ 'configs/data/cc15m-total.yaml', 'configs/data/laion-coco-total.yaml', 'configs/data/mscoco.yaml', 'configs/data/unsplash.yaml' ]
-    weights: [ 15, 480, 1, 4 ]
+    dataset_configs: [ 'configs/data/cc15m-total.yaml', 'configs/data/laion-coco.yaml', 'configs/data/mscoco.yaml', 'configs/data/unsplash.yaml' ]
+    weights: [ 15, 24, 1, 4 ]
     shardshuffle: 100
     resampled: True
     world_size: 1
@@ -38,8 +39,11 @@ dataset:
   text_max_length: 128
 
 stage1:
+  dino_model_name: 'dinov2_vitl14' # ['dinov2_vits14', 'dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14']
   unfreeze_unet: True
   image_size: 256 # [256, 512]
+  itc_weight: 0.5
+  slot_num:
 
 stage2:
   loss_weight:
@@ -53,7 +57,7 @@ stage2:
   use_blocks_image: True
   unclip: False
   vq:
-    vq_type: 'nsvq'
+    vq_type: 'residual_vq'
     codebook_embed_dim: 32
     n_embed: 8192
     replace_codes: True
@@ -64,10 +68,10 @@ stage2:
 experiment:
   seed: 0
   stage: 1
-  local_batch_size: 200
-  val_batch_size: 16
+  local_batch_size: 120
+  val_batch_size: 8
   test_split: train
-  max_epochs: 500
+  max_epochs: 100
   deterministic: False
   grad_accumulation: 1
   val_check_interval: 0.5
@@ -75,8 +79,8 @@ experiment:
   enable_checkpointing: True
   log_every_n_steps: 1
   num_sanity_val_steps: 1
-  num_warmup_steps: 200
-  grad_clip_val: 5
+  num_warmup_steps: 500
+  grad_clip_val: 2
   find_unused_parameters: True
 
 optimizer:

@@ -98,6 +98,7 @@ class SEEDTrainingWrapper(LightningModule):
             vit_precision=cfg.optimizer.vit_precision,
             diffusion_precision=cfg.optimizer.diffusion_precision,
             legacy=cfg.stage2.vq.legacy,
+            device="cpu",
         )
 
         self.B = None

@@ -1,19 +1,18 @@
 cfg_path: ???
 tokenizer_cfg_path: configs/tokenizer/seed_llama_tokenizer_hf.yaml
 # transform_cfg_path: configs/transform/clip_transform.yaml
-#transform_cfg_path: configs/transform/slot_transform_224.yaml
-transform_cfg_path: configs/transform/slot_transform.yaml
-model_cfg_path: configs/llm/seed_llama_8b.yaml
+transform_cfg_path: configs/transform/slot_transform_224.yaml
+model_cfg_path: configs/llm/seed_llama_8b.yaml 
 result_file_path: ./logs/slot_diffusion_debug
 # result_file_path: ./logs/seed_slot_layer1
 checkpoint_path:
-#  model_path: pretrained/seed_tokenizer/seed_quantizer.pt
-  model_path: pretrained/blip2_pretrained.pth
-#  diffusion_model_path: stabilityai/stable-diffusion-2-1-unclip
+  model_path: pretrained/seed_tokenizer/seed_quantizer.pt
+#  model_path: pretrained/blip2_pretrained.pth
 #slot_cfg_path: configs/slot_attn/config_12heads_dino.json
 
 resume: False
 load_weight: False
+# weight_path: /home/zheedong/Projects/SEED/logs/slot_stage1_related/slot_qformer_stage1_optim_changed_iter_3_totallayers_hparam_set/checkpoints/epoch=49-step=41283.ckpt
 weight_path:
 eval: False
 
@@ -23,8 +22,8 @@ dist:
 
 dataset:
   train_config:
-    dataset_configs: ['configs/data/cc15m.yaml']
-    weights: [1]
+    dataset_configs: [ 'configs/data/cc15m-total.yaml', 'configs/data/laion-coco-total.yaml', 'configs/data/mscoco.yaml', 'configs/data/unsplash.yaml' ]
+    weights: [ 15, 480, 1, 4 ]
     shardshuffle: 100
     resampled: True
     world_size: 1
@@ -40,10 +39,9 @@ dataset:
   text_max_length: 128
 
 stage1:
-  dino_model_name: 'dinov2_vitl14' # ['dinov2_vits14', 'dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14']
   unfreeze_unet: True
   image_size: 256 # [256, 512]
-#  causal_blocks_layers: 4
+  itc_weight:
 
 stage2:
   loss_weight:
@@ -55,27 +53,29 @@ stage2:
   blocks_image_layers:
   use_blocks_image: False
   vq:
-    vq_type: 'vq'
+    vq_type: 'residual_vq'
     codebook_embed_dim: 32
     n_embed: 8192
+    num_quantizers: 4
   bypass_codebook: False
 
 experiment:
   seed: 0
-  stage: 1
-#  local_batch_size: 4
-  local_batch_size: 1024
+  stage: 2
+  # local_batch_size: 220
+  # val_batch_size: 16
+  local_batch_size: 4
   val_batch_size: 4
   test_split: train
-  max_epochs: 200
+  max_epochs: 500
   deterministic: False
-  grad_accumulation: 2
+  grad_accumulation: 1
   val_check_interval: 0.5
   # check_val_every_n_epoch: 1 
   enable_checkpointing: True
   log_every_n_steps: 1
   num_sanity_val_steps: 0
-  num_warmup_steps: 200
+  num_warmup_steps: 1000
   grad_clip_val: 5
   find_unused_parameters: True
 
@@ -83,7 +83,7 @@ optimizer:
   vit_precision: 'fp16'
   diffusion_precision: 'fp16'
   precision: '16'
-  max_lr: 5e-5
+  max_lr: 2.5e-5
 
 hyperparameters:
   beta_1: 0.9

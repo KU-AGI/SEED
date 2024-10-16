@@ -51,8 +51,8 @@ from einops import rearrange, einsum
 logger = logging.get_logger(__name__)
 
 # TODO: slot attention layers are hard coded here
-# slot_attention_layers = [0, 2, 4, 6, 8, 10]
-slot_attention_layers = [6, 8, 10]
+slot_attention_layers = [0, 2, 4, 6, 8, 10]
+# slot_attention_layers = [6, 8, 10]
 print(f"Slot attention layers are hard coded here: {slot_attention_layers}")
 
 class BertEmbeddings(nn.Module):
@@ -265,6 +265,7 @@ class BertSelfAttention(nn.Module):
 
             # Now it is a slot attention
             is_cross_attention = encoder_hidden_states is not None # True for sure
+            slot_length = hidden_states.shape[1]
 
             key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
             value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
@@ -273,7 +274,7 @@ class BertSelfAttention(nn.Module):
                 attention_mask = encoder_attention_mask
 
             # Added : Key Normalization
-            key_layer = (32 ** (-0.5)) * key_layer
+            key_layer = (slot_length ** (-0.5)) * key_layer
 
             # TODO : to config
             T = 1
@@ -348,13 +349,16 @@ class BertSelfAttention(nn.Module):
 
                     context_layer = rearrange(context_layer, 'b h n_slots d -> b n_slots (h d)')
 
+                    n_slots = context_layer.shape[1] # 32
+                    d = context_layer.shape[2] # 768
+
                     # GRU is only implemented for fp32
                     context_layer = context_layer.float()
                     slots_prev = slots_prev.float()
 
-                    slots = self.gru(context_layer.view(-1, 768),
-                                     slots_prev.reshape(-1, 768))
-                    slots = slots.view(-1, 32, 768)
+                    slots = self.gru(context_layer.view(-1, d),
+                                     slots_prev.reshape(-1, d))
+                    slots = slots.view(-1, n_slots, d)
                     slots = slots + self.mlp(self.norm_mlp(slots))
 
                 attns_collect += [attn_vis]
@@ -810,6 +814,8 @@ class BertModel(BertPreTrainedModel):
 
         self.init_weights()
 
+        self.query_length = 32
+
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
 
@@ -859,8 +865,8 @@ class BertModel(BertPreTrainedModel):
             if is_decoder or is_casual:
                 batch_size, seq_length = input_shape
                 #print(input_shape)
-                if not is_decoder and seq_length > 32:
-                    query_length = 32
+                if not is_decoder and seq_length > self.query_length:
+                    query_length = self.query_length
                     text_length = seq_length - query_length
                     query_ids = torch.arange(query_length, device=device)
                     query_causal_mask = (query_ids[None, None, :].repeat(batch_size, query_length, 1) <= query_ids[None, :,
@@ -973,7 +979,7 @@ class BertModel(BertPreTrainedModel):
             assert (query_embeds is not None), "You have to specify query_embeds when input_ids is None"
 
         #if query_embeds is not None:
-        if query_embeds is not None and query_embeds.shape[1] == 32 and use_causal:
+        if query_embeds is not None and query_embeds.shape[1] == self.query_length and use_causal:
             is_casual = True # True
         else:
             is_casual = False

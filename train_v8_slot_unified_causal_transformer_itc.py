@@ -1,6 +1,7 @@
 import os
 from typing import Any, List
 import torch
+from django.templatetags.i18n import language
 from torch.cuda.amp import autocast
 import torch.nn as nn
 from torch.nn import functional as F
@@ -21,7 +22,7 @@ import pyrootutils
 from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
 import torch.nn.functional as F
 from pytorch_lightning.strategies import DDPStrategy, DDPFullyShardedStrategy
-from einops import rearrange
+from einops import rearrange, einsum
 import transformers
 from transformers import CLIPVisionModelWithProjection, CLIPTokenizer
 
@@ -40,9 +41,7 @@ from models.seed_llama_tokenizer import ImageTokenizer
 
 from datamodules.seed_llama_datamodule import SEEDDataModule
 
-from calculate_clip_score import calculate_clip_s_for_folder, calculate_lpips_for_folder, calculate_psnr_for_folder, \
-    calculate_ssim_for_folder
-
+from calculate_clip_score import calculate_clip_s_for_folder
 from utils.config import build_config
 
 from lavis.models import load_model
@@ -75,6 +74,8 @@ IMG_FLAG = "<image>"
 NUM_IMG_TOKNES = 32
 NUM_IMG_CODES = 8192
 IMAGE_ID_SHIFT = 32000
+
+INF = 1e9
 
 class GatherLayer(torch.autograd.Function):
     """
@@ -171,7 +172,9 @@ class SlotTrainingWrapper(LightningModule):
         self.slot_attention = MultiHeadSTEVESA.from_config(slot_attn_config)            
         self.slot_size = slot_attn_config['slot_size']  # 768
         self.num_slots = slot_attn_config['num_slots']  # 32
-        self.out_size = slot_attn_config['out_size']    # 1024
+        self.out_size = slot_attn_config['out_size']  # 1024
+
+        self.similarity_threshold = 1 / self.num_slots
 
         self.out_linear_1024 = self.slot_attention.out_linear
 
@@ -191,24 +194,34 @@ class SlotTrainingWrapper(LightningModule):
         self.backbone = DINOBackbone(dinov2).eval()
 
         self.pos_embed_causal_blocks = nn.Parameter(torch.zeros(1, self.num_slots, self.out_size))
-        # Causal transformer
         self.causal_blocks = nn.ModuleList([
             Block(dim=self.out_size,
-                    num_heads=16,
-                    mlp_ratio=4.0,
-                    qkv_bias=True,
-                    qk_scale=None,
-                    drop=0.0,
-                    attn_drop=0.0,
-                    drop_path=0.0,
-                    norm_layer=partial(nn.LayerNorm, eps=1e-6)) for _ in range(cfg.stage1.causal_blocks_layers)
+                  num_heads=16,
+                  mlp_ratio=4.0,
+                  qkv_bias=True,
+                  qk_scale=None,
+                  drop=0.0,
+                  attn_drop=0.0,
+                  drop_path=0.0,
+                  norm_layer=partial(nn.LayerNorm, eps=1e-6)) for _ in range(cfg.stage1.causal_blocks_layers)
         ])
 
+        # Language model
+        from transformers import BertTokenizerFast, BertModel
+        import spacy
+        self.lm_tokenizer = BertTokenizerFast.from_pretrained("bert-large-uncased")
+        self.lm_model = BertModel.from_pretrained("bert-large-uncased")
+        self.nlp = spacy.load("en_core_web_sm")
+
+        self.temp = nn.Parameter(torch.ones([]) * 0.07)
+        self.temp_sparc = nn.Parameter(torch.ones([]) * 0.1)
+        self.text_feat_proj = nn.Linear(self.lm_model.config.hidden_size, 1024)
+
         if self.stage == 2:
-            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_slots, self.out_size))
+            self.pos_embed_blocks = nn.Parameter(torch.zeros(1, self.num_slots, self.slot_size))
             self.blocks = nn.ModuleList([
-                Block(dim=self.out_size,
-                        num_heads=16,
+                Block(dim=self.slot_size,
+                        num_heads=12,
                         mlp_ratio=4.0,
                         qkv_bias=True,
                         qk_scale=None,
@@ -218,10 +231,10 @@ class SlotTrainingWrapper(LightningModule):
                         norm_layer=partial(nn.LayerNorm, eps=1e-6)) for _ in range(self.cfg.stage2.blocks_layers)
             ])
             if self.cfg.stage2.use_blocks_image:
-                self.pos_embed_image = nn.Parameter(torch.zeros(1, self.num_slots, self.out_size))
+                self.pos_embed_blocks_image = nn.Parameter(torch.zeros(1, self.num_slots, self.slot_size))
                 self.blocks_image = nn.ModuleList([
-                    Block(dim=self.self.out_size,
-                            num_heads=16,
+                    Block(dim=self.slot_size,
+                            num_heads=12,
                             mlp_ratio=4.0,
                             qkv_bias=True,
                             qk_scale=None,
@@ -236,9 +249,18 @@ class SlotTrainingWrapper(LightningModule):
 
             print(f"n_embed: {n_embed}, codebook_embed_dim: {codebook_embed_dim}")
 
-            if hasattr(self.cfg.stage2.vq, "vq_type") and self.cfg.stage2.vq.vq_type == "nsvq":
-                print("Using NSVQ")
-                self.quantize = NSVQ(
+            if hasattr(self.cfg.stage2.vq, "vq_type") and self.cfg.stage2.vq.vq_type == "residual_vq":
+                print("Using residual VQ")
+                from vector_quantize_pytorch import ResidualVQ
+                self.quantize = ResidualVQ(
+                    dim=self.slot_size,
+                    num_quantizers=self.cfg.stage2.vq.num_quantizers,
+                    codebook_size=n_embed,
+                    codebook_dim=codebook_embed_dim,
+                    shared_codebook=True,
+                )
+            else:
+                self.quantize = VectorQuantizer2(
                     n_e=n_embed,
                     e_dim=codebook_embed_dim,
                     beta=0.25,
@@ -247,20 +269,7 @@ class SlotTrainingWrapper(LightningModule):
                     legacy=False,
                     discarding_threshold=0.01,
                 )
-            elif hasattr(self.cfg.stage2.vq, "vq_type") and self.cfg.stage2.vq.vq_type == "residual_vq":
-                print("Using residual VQ")
-                from vector_quantize_pytorch import ResidualVQ
-                self.quantize = ResidualVQ(
-                    dim=self.out_size,
-                    num_quantizers=self.cfg.stage2.vq.num_quantizers,
-                    codebook_size=n_embed,
-                    codebook_dim=codebook_embed_dim,
-                    shared_codebook=True,
-                )
-            else:
-                print("Using VQ")
-                self.quantize = VectorQuantizer2(n_e=n_embed, e_dim=codebook_embed_dim)
-
+            
                 # 768 => codebook_embed_dim
                 self.encode_task_layer = nn.Sequential(
                     nn.Linear(self.slot_size, self.slot_size),
@@ -279,6 +288,10 @@ class SlotTrainingWrapper(LightningModule):
         # Freeze backbone
         for param in self.backbone.parameters():
             param.requires_grad = False
+
+        # Freeze lm model
+        for parm in self.lm_model.parameters():
+            parm.requires_grad = False
 
         # Diffusion frozen
         for param in self.image_encoder.parameters():
@@ -447,7 +460,8 @@ class SlotTrainingWrapper(LightningModule):
 
         # timestep is not used, but should we?
         backbone_input = self.normalize_vit(batch[0])
-        feat = self.backbone(backbone_input)
+        with torch.no_grad():
+            feat = self.backbone(backbone_input)
 
         slots, attn = self.slot_attention(feat[:, None], apply_out_linear=False)  # for the time dimension
         # Remove T dimension
@@ -461,8 +475,6 @@ class SlotTrainingWrapper(LightningModule):
         slots = self.get_slot_embedding(batch, batch_idx)
 
         slots_1024 = self.out_linear_1024(slots)
-
-        slots_1024 = self.apply_transformer(slots_1024, self.causal_blocks, self.pos_embed_causal_blocks, use_causal_mask=True)
 
         # Predict the noise residual
         model_pred = self.unet(
@@ -483,7 +495,7 @@ class SlotTrainingWrapper(LightningModule):
         loss_diffusion = F.mse_loss(model_pred.float(),
                             target.float(), reduction="mean")
         logging_dict["loss_diffusion"] = loss_diffusion
-        
+
         # loss logging
         cur_stage = "train" if not is_validation else "val"
         for key in logging_dict.keys():
@@ -496,9 +508,268 @@ class SlotTrainingWrapper(LightningModule):
                 logger=True,
                 sync_dist=True,
             )
-        
+
         return loss_diffusion, slots, slots_1024
-    
+
+    def get_noun_indices(self, text):
+        doc = self.nlp(text)
+        nouns = [token.text for token in doc if token.pos_ == "NOUN"]
+        return [i for i, token in enumerate(doc) if token.pos_ == "NOUN"], nouns
+
+    def masked_pairwise_contrastive_loss(self, a, b, mask=None):
+        batch_size, seq_len, _ = a.shape  # a: [batch_size, seq_len, dim]
+
+        # Compute logits: [batch_size, seq_len, seq_len]
+        logits = torch.einsum('b m d, b n d -> b m n', a, b) / self.temp_sparc
+
+        # Flatten logits to shape [(batch_size * seq_len), seq_len]
+        logits = logits.view(-1, seq_len)
+
+        # Create labels: each position in seq_len is its own class
+        labels = torch.arange(seq_len).unsqueeze(0).expand(batch_size, seq_len).flatten().to(self.device)  # [batch_size * seq_len]
+
+        # Flatten the mask to shape [(batch_size * seq_len)]
+        mask_flat = mask.view(-1)
+
+        # Filter logits and labels where mask is 1
+        logits = logits[mask_flat == 1]
+        labels = labels[mask_flat == 1]
+
+        # Compute the loss only over the unmasked positions
+        loss = F.cross_entropy(logits, labels, reduction='mean')
+
+        return loss
+
+    def get_stage1_loss(self, batch, batch_idx: int, is_validation=False):
+        logging_dict = {}
+
+        # Prepare inputs
+        noisy_model_input, noise, timesteps, model_input = self.get_diffusion_noisy_model_input(batch)
+
+        # Get slot embeddings
+        slots = self.get_slot_embedding(batch, batch_idx)  # [b, 32, 768]
+        slots_1024 = self.out_linear_1024(slots)  # [b, 32, 1024]
+
+        # Apply causal transformer
+        slots_1024_causal = self.apply_transformer(
+            slots_1024,
+            self.causal_blocks,
+            self.pos_embed_causal_blocks,
+            use_causal_mask=True
+        )  # [b, 32, 1024]
+
+        # Compute image features for contrastive loss
+        # Global semantic contrastive loss
+        # Average slots to get image embeddings
+        image_feats = slots_1024_causal.mean(dim=1)  # [b, 1024]
+        image_feats = F.normalize(image_feats, dim=-1)
+
+        # Get text features using BERT
+        text_inputs = self.lm_tokenizer(
+            batch[1], return_tensors="pt", padding=True, truncation=True, return_offsets_mapping=True
+        ).to(self.device)
+        offset_mappings = text_inputs.pop("offset_mapping")
+        text_outputs = self.lm_model(**text_inputs)
+        text_feats = text_outputs.last_hidden_state  # [b, seq_len, bert_dim]
+        language_mask = text_inputs["attention_mask"]
+        text_feats_cls = text_feats[:, 0, :]  # [b, bert_dim]
+
+        # Project text features to match image feature dimension (1024)
+        if not hasattr(self, 'text_feat_proj'):
+            self.text_feat_proj = nn.Linear(self.lm_model.config.hidden_size, image_feats.size(-1)).to(self.device)
+        text_feats_proj = self.text_feat_proj(text_feats_cls)  # [b, 1024]
+        text_feats_proj = F.normalize(text_feats_proj, dim=-1)
+
+        # Now compute the global semantic contrastive loss
+        # Need to all_gather the image and text features if using distributed training
+        image_feats_all = self.all_gather_with_grad(image_feats)
+        text_feats_all = self.all_gather_with_grad(text_feats_proj)
+
+        # Compute similarity matrix
+        sim_i2t = torch.matmul(
+            rearrange(image_feats, "b d -> b 1 1 d"),
+            rearrange(text_feats_all, "(bs ngpus) d -> (bs ngpus) d 1", bs = image_feats.size(0))
+        ).squeeze()     # [b, b * ngpus, d]
+        sim_i2t = sim_i2t / self.temp
+
+        sim_t2q = torch.matmul(
+            rearrange(text_feats_proj, "b d -> b 1 1 d"),
+            rearrange(image_feats_all, "(bs ngpus) d -> (bs ngpus) d 1", bs = image_feats.size(0))
+        ).squeeze()     # [b, b * ngpus, d]
+        sim_t2i = sim_t2q / self.temp
+
+        # For cross entropy, need targets
+        rank = dist.get_rank()
+        bs = image_feats.size(0)
+        targets = torch.linspace(
+            rank * bs, rank * bs + bs - 1, bs,
+            dtype=int,
+        ).to(self.device)
+
+        loss_itc = (
+            F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
+            + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
+        ) / 2
+
+        logging_dict["loss_itc"] = loss_itc
+
+        # Object-centric contrastive loss
+        '''
+        total_noun_embeddings = []
+        total_slot_embeddings = []
+
+        for idx, text in enumerate(batch[1]):
+            # Extract noun indices and spans using spaCy
+            doc = self.nlp(text)
+            noun_spans = [(token.idx, token.idx + len(token.text)) for token in doc if token.pos_ == "NOUN"]
+
+            if len(noun_spans) == 0:
+                continue
+            elif len(noun_spans) > 1:
+                # For now, only consider the first 1 nouns
+                noun_spans = noun_spans[:1]
+
+            # Get token offsets from tokenizer for this sample
+            offsets = offset_mappings[idx]  # [seq_len, 2]
+
+            # Map tokens to noun indices
+            noun_token_indices = []
+            for i, (start, end) in enumerate(offsets):
+                for noun_start, noun_end in noun_spans:
+                    if start >= noun_start and end <= noun_end:
+                        noun_token_indices.append(i)
+                        break
+
+            if len(noun_token_indices) == 0:
+                continue
+
+            # Get the embeddings for these tokens
+            text_feat = text_feats[idx]  # [seq_len, bert_dim]
+            noun_embeddings = text_feat[noun_token_indices, :]  # [n_nouns, bert_dim]
+
+            # Project to 1024 dim
+            noun_embeddings_proj = self.text_feat_proj(noun_embeddings)  # [n_nouns, 1024]
+            noun_embeddings_proj = F.normalize(noun_embeddings_proj, dim=-1)
+
+            # Get slot embeddings for this sample
+            slot_embeddings = slots_1024_causal[idx]  # [n_slots, 1024]
+            slot_embeddings_norm = F.normalize(slot_embeddings, dim=-1)
+
+            # Compute similarity between noun embeddings and slot embeddings
+            sim = noun_embeddings_proj @ slot_embeddings_norm.t()  # [n_nouns, n_slots]
+
+            # For each noun, find the slot with highest similarity
+            max_sim, max_slot_indices = sim.max(dim=1)  # [n_nouns]
+
+            # Collect positive pairs
+            total_noun_embeddings.append(noun_embeddings_proj)
+            total_slot_embeddings.append(slot_embeddings_norm[max_slot_indices])
+
+        if len(total_noun_embeddings) > 0:
+            total_noun_embeddings = torch.cat(total_noun_embeddings, dim=0)
+            total_slot_embeddings = torch.cat(total_slot_embeddings, dim=0)
+
+            # All gather
+            all_noun_embeddings = self.all_gather_with_grad(total_noun_embeddings)
+            all_slot_embeddings = self.all_gather_with_grad(total_slot_embeddings)
+
+            # Compute similarities
+            sim_n2s = torch.matmul(
+                rearrange(total_noun_embeddings, "n d -> n 1 1 d"),
+                rearrange(all_slot_embeddings, "(n ngpus) d -> (n ngpus) d 1", n = total_noun_embeddings.size(0))
+            ).squeeze()     # [n, b * ngpus]
+            sim_n2s = sim_n2s / self.temp
+
+            sim_s2n = torch.matmul(
+                rearrange(total_slot_embeddings, "n d -> n 1 1 d"),
+                rearrange(all_noun_embeddings, "(n ngpus) d -> (n ngpus) d 1", n = total_slot_embeddings.size(0))
+            ).squeeze()
+            sim_s2n = sim_s2n / self.temp
+
+            # For cross entropy, need targets
+            rank = dist.get_rank()
+            bs = total_noun_embeddings.size(0)
+            targets = torch.linspace(
+                rank * bs, rank * bs + bs - 1, bs,
+                dtype=int
+            ).to(self.device)
+
+            loss_occ = (
+                F.cross_entropy(sim_n2s, targets, label_smoothing=0.1)
+                + F.cross_entropy(sim_s2n, targets, label_smoothing=0.1)
+            ) / 2
+        else:
+            loss_occ = torch.tensor(0.0).to(self.device)
+        logging_dict["loss_occ"] = loss_occ
+        '''
+        # SPARC Style Object-centric contrastive loss
+        # similarity calculation
+        l_token_embed = self.text_feat_proj(text_feats)
+        v_patch_embed = slots_1024_causal
+        similarity = einsum(l_token_embed, v_patch_embed, "b seq d, b slots d -> b seq slots")
+
+        # Min-max normalization
+        similarity_min = similarity.min(dim=-1, keepdim=True)[0]
+        similarity_max = similarity.max(dim=-1, keepdim=True)[0]
+        similarity = (similarity - similarity_min) / (similarity_max - similarity_min + 1e-8)
+
+        # thresholding
+        similarity = torch.where(similarity < self.similarity_threshold, 0.0, similarity)
+
+        # alignment - weighting
+        v_align_weights = similarity / similarity.sum(dim=-1, keepdim=True)
+        l_grouped_v_path_embed = einsum(v_align_weights, v_patch_embed, "b seq slots, b slots d -> b seq d")
+
+        l_grouped_v_path_embed = F.normalize(l_grouped_v_path_embed, dim=-1)
+        l_token_embed = F.normalize(l_token_embed, dim=-1)
+
+        loss_vl_local = self.masked_pairwise_contrastive_loss(l_grouped_v_path_embed, l_token_embed, mask=language_mask)
+        loss_lv_local = self.masked_pairwise_contrastive_loss(l_token_embed, l_grouped_v_path_embed, mask=language_mask)
+
+        loss_occ = (loss_vl_local + loss_lv_local) / 2
+        logging_dict["loss_occ"] = loss_occ
+
+        # Diffusion loss
+        # Predict the noise residual
+        model_pred = self.unet(
+            noisy_model_input, timesteps, slots_1024_causal,
+        ).sample
+
+        # Get the target for loss depending on the prediction type
+        if self.scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif self.scheduler.config.prediction_type == "v_prediction":
+            target = self.scheduler.get_velocity(
+                model_input, noise, timesteps
+            )
+        else:
+            raise ValueError(
+                f"Unknown prediction type {self.scheduler.config.prediction_type}"
+            )
+
+        # Compute diffusion loss
+        loss_diffusion = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        logging_dict["loss_diffusion"] = loss_diffusion
+
+        # Combine the losses
+        total_loss = loss_diffusion + 0.1 * loss_itc + 0.05* loss_occ
+        logging_dict["loss"] = total_loss
+
+        # Log the losses
+        cur_stage = "train" if not is_validation else "val"
+        for key in logging_dict.keys():
+            self.log(
+                f"{cur_stage}/{key}",
+                logging_dict[key],
+                on_step=not is_validation,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                sync_dist=True,
+            )
+
+        return total_loss, slots, slots_1024_causal
+
     def calculate_rec_loss(self, rec, target):
         target = target / target.norm(dim=-1, keepdim=True)
         rec = rec / rec.norm(dim=-1, keepdim=True)
@@ -523,26 +794,60 @@ class SlotTrainingWrapper(LightningModule):
         with torch.no_grad():
             slots = self.get_slot_embedding(batch, batch_idx)
 
-            slots_1024 = self.out_linear_1024(slots)
-
-            slots_1024 = self.apply_transformer(slots_1024, self.causal_blocks, self.pos_embed_causal_blocks, use_causal_mask=True)
-
-        # Quantize slots
-        quant, embed_ind, loss_codebook = self.quantize(slots_1024)
-
-        if self.cfg.stage2.vq.vq_type == "residual_vq":
-            loss_codebook = loss_codebook.sum()
-
+        # [b, 32, 768] => [b, 32, 32]
+        slots_down = self.encode_task_layer(slots)
+        
+        quant, loss_codebook, embed_ind, perplexity = self.quantize(slots_down)
         logging_dict["loss_codebook"] = loss_codebook
-
+        logging_dict["sim_32"] = F.cosine_similarity(slots_down, quant, dim=-1).mean()
+        logging_dict["perplexity"] = perplexity
+        logging_dict["codebook_util"] = self.get_codebook_util(embed_ind)
+        
         # Flatten the quantized slots
         embed_ind = embed_ind.reshape(slots.shape[0], -1)
 
-        slots_1024_blocks_applied = self.apply_transformer(quant, self.blocks, self.pos_embed, use_causal_mask=False)
+        # codebook replacement
+        replacement_num_batches = self.cfg.stage2.vq.replacement_num_batches
+        #if ((self.global_step + 1) % replacement_num_batches == 0) & (self.global_step <= replacement_num_batches - 2 * replacement_num_batches):
+        if ((batch_idx + 1) % replacement_num_batches == 0) and self.cfg.stage2.vq.replace_codes:
+            num_replaced_codebook = self.quantize.replace_unused_codebooks(replacement_num_batches)
+        else:
+            num_replaced_codebook = -1
 
-        loss_recon = F.mse_loss(slots_1024, slots_1024_blocks_applied, reduction="mean")
-        logging_dict["loss_recon"] = loss_recon
-        logging_dict["sim_768"] = F.cosine_similarity(slots_1024, slots_1024_blocks_applied, dim=-1).mean()
+        # [b, 32, 32] => [b, 32, 768]
+        slots_up_768 = self.decode_task_layer(quant)
+
+        # [b, 32, 768] => [b, 32, 1024]
+        if self.cfg.stage2.use_blocks_image:
+            # Apply transformer blocks
+            slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
+            
+            loss_recon = self.calculate_rec_loss(slots_up_768_blocks_applied, slots)
+            logging_dict["loss_recon"] = loss_recon
+            logging_dict["sim_768"] = F.cosine_similarity(slots_up_768_blocks_applied, slots, dim=-1).mean()
+            # Separate transformer blocks for image
+            slots_up_768_blocks_image_applied = self.apply_transformer(slots_up_768, self.blocks_image)
+            slots_1024 = self.out_linear_1024(slots_up_768_blocks_image_applied)
+
+        else:
+            recon_debug = True
+            if recon_debug:
+                # Recon loss before transformer
+                loss_recon = self.calculate_rec_loss(slots_up_768, slots)
+                logging_dict["loss_recon"] = loss_recon
+                logging_dict["sim_768"] = F.cosine_similarity(slots_up_768, slots, dim=-1).mean()
+
+                # Apply transformer blocks
+                slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
+                slots_1024 = self.out_linear_1024(slots_up_768_blocks_applied)
+            else:
+                # Apply transformer blocks
+                slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
+                
+                loss_recon = self.calculate_rec_loss(slots_up_768_blocks_applied, slots)
+                logging_dict["loss_recon"] = loss_recon
+                logging_dict["sim_768"] = F.cosine_similarity(slots_up_768_blocks_applied, slots, dim=-1).mean()
+                slots_1024 = self.out_linear_1024(slots_up_768_blocks_applied)
 
         # Compute diffusion loss
         noisy_model_input, noise, timesteps, model_input = self.get_diffusion_noisy_model_input(batch)
@@ -550,7 +855,7 @@ class SlotTrainingWrapper(LightningModule):
         # Predict the noise residual
         # By using the reconstructed slot
         model_pred = self.unet(
-            noisy_model_input, timesteps, slots_1024_blocks_applied,
+            noisy_model_input, timesteps, slots_1024,
         ).sample
 
         # Get the target for loss depending on the prediction type
@@ -569,9 +874,14 @@ class SlotTrainingWrapper(LightningModule):
         logging_dict["loss_diffusion"] = loss_diffusion
 
         # Combine loss
-        loss = self.cfg.stage2.loss_weight.loss_codebook * loss_codebook + \
-                self.cfg.stage2.loss_weight.loss_recon * loss_recon + \
-                self.cfg.stage2.loss_weight.loss_diffusion * loss_diffusion
+        if hasattr(self.cfg.stage2, "vq_type") and self.cfg.stage2.vq_type == "nsvq":
+            # Don't use codebook loss when using nsvq
+            loss = self.cfg.stage2.loss_weight.loss_recon * loss_recon + \
+                    self.cfg.stage2.loss_weight.loss_diffusion * loss_diffusion
+        else:
+            loss = self.cfg.stage2.loss_weight.loss_codebook * loss_codebook + \
+                    self.cfg.stage2.loss_weight.loss_recon * loss_recon + \
+                    self.cfg.stage2.loss_weight.loss_diffusion * loss_diffusion
         logging_dict["loss"] = loss
 
         # loss logging
@@ -587,7 +897,7 @@ class SlotTrainingWrapper(LightningModule):
                 sync_dist=True,
             )
 
-        return loss, slots_1024_blocks_applied
+        return loss, slots_up_768_blocks_applied, slots_1024
 
     def on_train_start(self):
         self.print(f"\n====Traing Stage {self.stage}====")
@@ -606,7 +916,7 @@ class SlotTrainingWrapper(LightningModule):
         self.B = image.shape[0]
 
         if self.stage == 1:
-            loss, *_ = self.get_diffusion_loss(batch, batch_idx)
+            loss, *_ = self.get_stage1_loss(batch, batch_idx)
         elif self.stage == 2:
             loss, *_ = self.get_quantize_loss(batch, batch_idx)
         
@@ -664,9 +974,9 @@ class SlotTrainingWrapper(LightningModule):
 
         img, text, image_id = batch
         if self.stage == 1:
-            _, _, slots_1024 = self.get_diffusion_loss(batch, batch_idx, is_validation=True)
+            _, _, slots_1024 = self.get_stage1_loss(batch, batch_idx, is_validation=True)
         else:
-            _, slots_1024 = self.get_quantize_loss(batch, batch_idx, is_validation=True)
+            _, _, slots_1024 = self.get_quantize_loss(batch, batch_idx, is_validation=True)
 
         # Change validation scheduler
         cur_scheduler = self.scheduler
@@ -698,68 +1008,15 @@ class SlotTrainingWrapper(LightningModule):
         generated_image_dir = self.save_path
         try:
             clip_score = calculate_clip_s_for_folder(original_image_dir, generated_image_dir)
-            self.log(
-                "metrics/clip_score",
-                clip_score,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                logger=True,
-                sync_dist=True,
-            )
         except Exception as e:
             self.print(f"Error: {e}")
             clip_score = 0
-
-        try:
-            lpips = calculate_lpips_for_folder(original_image_dir, generated_image_dir)
-            self.log(
-                "metrics/lpips",
-                lpips,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                logger=True,
-                sync_dist=True,
-            )
-        except Exception as e:
-            self.print(f"Error: {e}")
-            lpips = 0
-
-        try:
-            psnr = calculate_psnr_for_folder(original_image_dir, generated_image_dir)
-            self.log(
-                "metrics/psnr",
-                psnr,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                logger=True,
-                sync_dist=True,
-            )
-        except Exception as e:
-            self.print(f"Error: {e}")
-            psnr = 0
-
-        try:
-            ssim = calculate_ssim_for_folder(original_image_dir, generated_image_dir)
-            self.log(
-                "metrics/ssim",
-                ssim,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                logger=True,
-                sync_dist=True,
-            )
-        except Exception as e:
-            self.print(f"Error: {e}")
-            ssim = 0
-
+        
+        self.print(f"clip score: {clip_score}")
         self.log_dict({
             'clip_score': clip_score,
-        }, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-
+        },on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        
         self.log(
             "clip_score_coco_karpathy",
             clip_score,

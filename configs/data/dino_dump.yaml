@@ -1,0 +1,4 @@
+META:
+  - ["/ssd0/data/cc3m_val/cc3m_dino_test/{00000..00001}.tar", 20000]
+
+MAX_WORDS: 128

@@ -21,8 +21,8 @@ dist:
 
 dataset:
   train_config:
-    dataset_configs: [ 'configs/data/cc15m.yaml', 'configs/data/laion-coco.yaml', 'configs/data/mscoco.yaml', 'configs/data/unsplash.yaml' ]
-    weights: [ 15, 24, 1, 4 ]
+    dataset_configs: [ 'configs/data/cc15m-total.yaml', 'configs/data/laion-coco-total.yaml', 'configs/data/mscoco.yaml', 'configs/data/unsplash.yaml' ]
+    weights: [ 15, 480, 1, 4 ]
     shardshuffle: 100
     resampled: True
     world_size: 1
@@ -54,7 +54,7 @@ stage2:
   unclip: False
   vq:
     vq_type: 'nsvq'
-    codebook_embed_dim: 768
+    codebook_embed_dim: 32
     n_embed: 8192
     replace_codes: True
     replacement_num_batches: 1000
@@ -64,10 +64,10 @@ stage2:
 experiment:
   seed: 0
   stage: 1
-  local_batch_size: 220
+  local_batch_size: 200
   val_batch_size: 16
   test_split: train
-  max_epochs: 200
+  max_epochs: 500
   deterministic: False
   grad_accumulation: 1
   val_check_interval: 0.5

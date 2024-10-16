@@ -11,8 +11,9 @@ checkpoint_path:
 slot_cfg_path: configs/slot_attn/config_12heads_dino.json
 
 resume: False
-load_weight: False
-weight_path:
+load_weight: True
+# weight_path:
+weight_path: /home/zheedong/Projects/SEED/logs/slot_stage1_related/seed_slot_layer1_dino_12head_dataaug_learnablequery_200epoch_crossattn_unfreeze/checkpoints/epoch=88-step=122926.ckpt
 # weight_path: pretrained/seed_slot_layer1_dino_12head_dataaug_learnablequery_200epoch_crossattn_unfreeze/checkpoints/epoch=88-step=122926.ckpt
 # weight_path: logs/slot_quantization_related/nsvq_train_blocks_image_freeze_unet_linear_8_blocks_768_embed_dim_16384_codebook_dim_6gpus/checkpoints/epoch=65-step=21515.ckpt
 eval: False
@@ -72,14 +73,15 @@ experiment:
   test_split: train
   max_epochs: 200
   deterministic: False
-  grad_accumulation: 6
+  grad_accumulation: 2
   val_check_interval: 0.5
   # check_val_every_n_epoch: 1 
   enable_checkpointing: True
   log_every_n_steps: 1
-  num_sanity_val_steps: 1
+  num_sanity_val_steps: 2
   num_warmup_steps: 200
   grad_clip_val: 5
+  find_unused_parameters: True
 
 optimizer:
   vit_precision: 'fp16'

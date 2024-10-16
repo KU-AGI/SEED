@@ -528,6 +528,7 @@ class Blip2QformerQuantizer(Blip2Base):
         self.Qformer.cls = None
         # word_embedding [30522, 768] to [30523, 768]
         self.Qformer.bert.embeddings.word_embeddings = nn.Embedding(30523, self.Qformer.config.hidden_size)
+
         # self.Qformer.bert.embeddings.word_embeddings = None
         # self.Qformer.bert.embeddings.position_embeddings = None
         # for layer in self.Qformer.bert.encoder.layer:
@@ -566,14 +567,14 @@ class Blip2QformerQuantizer(Blip2Base):
             nn.Linear(codebook_embed_dim, self.Qformer.config.hidden_size)  # for quantize
         )
 
-        if not is_train:
-            self.quantize = self.quantize.eval()
-
-        self.quantize.training = is_train
-        for name, param in self.named_parameters():
-            if 'quantize' in name or 'encode_task_layer' in name or 'decode_task_layer' in name:
-                #print('freeze params', name)
-                param.requires_grad = is_train
+        # if not is_train:
+        #     self.quantize = self.quantize.eval()
+        #
+        # self.quantize.training = is_train
+        # for name, param in self.named_parameters():
+        #     if 'quantize' in name or 'encode_task_layer' in name or 'decode_task_layer' in name:
+        #         #print('freeze params', name)
+        #         param.requires_grad = is_train
 
         if self.recon_s:
             self.pos_embed = nn.Parameter(torch.zeros(1, num_query_token, self.Qformer.config.hidden_size))

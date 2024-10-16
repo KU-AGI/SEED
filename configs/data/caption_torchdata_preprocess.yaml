@@ -1,0 +1,11 @@
+_target_: src.data.torchdata_preprocess.build_caption_datapipes_with_pixels
+data_dir: 
+#  - ${oc.env:PROJECT_ROOT}/data/cc3m
+  - /ssd0/data/cc3m_val
+
+max_length: 128
+similarity_thr: 1
+min_resolution: 0
+min_aspect_ratio: 0
+use_caption_in_metadata: False
+caption_key_in_metadata: 'top_caption'

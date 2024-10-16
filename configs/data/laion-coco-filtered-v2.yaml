@@ -1,0 +1,4 @@
+META:
+  - ["/nas/backup/data/laion-coco-final-v2/{00000..66302}.tar", 660000000]
+
+MAX_WORDS: 128

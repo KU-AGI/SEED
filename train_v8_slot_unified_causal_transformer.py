@@ -40,9 +40,7 @@ from models.seed_llama_tokenizer import ImageTokenizer
 
 from datamodules.seed_llama_datamodule import SEEDDataModule
 
-from calculate_clip_score import calculate_clip_s_for_folder, calculate_lpips_for_folder, calculate_psnr_for_folder, \
-    calculate_ssim_for_folder
-
+from calculate_clip_score import calculate_clip_s_for_folder
 from utils.config import build_config
 
 from lavis.models import load_model
@@ -169,9 +167,8 @@ class SlotTrainingWrapper(LightningModule):
         # Define slot attention
         slot_attn_config = MultiHeadSTEVESA.load_config(cfg.slot_cfg_path)
         self.slot_attention = MultiHeadSTEVESA.from_config(slot_attn_config)            
-        self.slot_size = slot_attn_config['slot_size']  # 768
-        self.num_slots = slot_attn_config['num_slots']  # 32
-        self.out_size = slot_attn_config['out_size']    # 1024
+        self.slot_size = slot_attn_config['slot_size']
+        self.num_slots = slot_attn_config['num_slots']
 
         self.out_linear_1024 = self.slot_attention.out_linear
 
@@ -190,25 +187,11 @@ class SlotTrainingWrapper(LightningModule):
         dinov2 = torch.hub.load("facebookresearch/dinov2", cfg.stage1.dino_model_name)
         self.backbone = DINOBackbone(dinov2).eval()
 
-        self.pos_embed_causal_blocks = nn.Parameter(torch.zeros(1, self.num_slots, self.out_size))
-        # Causal transformer
-        self.causal_blocks = nn.ModuleList([
-            Block(dim=self.out_size,
-                    num_heads=16,
-                    mlp_ratio=4.0,
-                    qkv_bias=True,
-                    qk_scale=None,
-                    drop=0.0,
-                    attn_drop=0.0,
-                    drop_path=0.0,
-                    norm_layer=partial(nn.LayerNorm, eps=1e-6)) for _ in range(cfg.stage1.causal_blocks_layers)
-        ])
-
         if self.stage == 2:
-            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_slots, self.out_size))
+            self.pos_embed = nn.Parameter(torch.zeros(1, 32, self.slot_size))
             self.blocks = nn.ModuleList([
-                Block(dim=self.out_size,
-                        num_heads=16,
+                Block(dim=self.slot_size,
+                        num_heads=12,
                         mlp_ratio=4.0,
                         qkv_bias=True,
                         qk_scale=None,
@@ -218,10 +201,9 @@ class SlotTrainingWrapper(LightningModule):
                         norm_layer=partial(nn.LayerNorm, eps=1e-6)) for _ in range(self.cfg.stage2.blocks_layers)
             ])
             if self.cfg.stage2.use_blocks_image:
-                self.pos_embed_image = nn.Parameter(torch.zeros(1, self.num_slots, self.out_size))
                 self.blocks_image = nn.ModuleList([
-                    Block(dim=self.self.out_size,
-                            num_heads=16,
+                    Block(dim=self.slot_size,
+                            num_heads=12,
                             mlp_ratio=4.0,
                             qkv_bias=True,
                             qk_scale=None,
@@ -247,33 +229,30 @@ class SlotTrainingWrapper(LightningModule):
                     legacy=False,
                     discarding_threshold=0.01,
                 )
-            elif hasattr(self.cfg.stage2.vq, "vq_type") and self.cfg.stage2.vq.vq_type == "residual_vq":
-                print("Using residual VQ")
-                from vector_quantize_pytorch import ResidualVQ
-                self.quantize = ResidualVQ(
-                    dim=self.out_size,
-                    num_quantizers=self.cfg.stage2.vq.num_quantizers,
-                    codebook_size=n_embed,
-                    codebook_dim=codebook_embed_dim,
-                    shared_codebook=True,
-                )
             else:
-                print("Using VQ")
-                self.quantize = VectorQuantizer2(n_e=n_embed, e_dim=codebook_embed_dim)
-
-                # 768 => codebook_embed_dim
-                self.encode_task_layer = nn.Sequential(
-                    nn.Linear(self.slot_size, self.slot_size),
-                    nn.Tanh(),
-                    nn.Linear(self.slot_size, codebook_embed_dim)  # for quantize
+                self.quantize = VectorQuantizer2(
+                    n_e=n_embed,
+                    e_dim=codebook_embed_dim,
+                    beta=0.25,
+                    remap=None,
+                    sane_index_shape=False,
+                    legacy=False,
+                    discarding_threshold=0.01,
                 )
+            
+            # 768 => codebook_embed_dim
+            self.encode_task_layer = nn.Sequential(
+                nn.Linear(self.slot_size, self.slot_size),
+                nn.Tanh(),
+                nn.Linear(self.slot_size, codebook_embed_dim)  # for quantize
+            )
 
-                # codebook_embed_dim => 768
-                self.decode_task_layer = nn.Sequential(
-                    nn.Linear(codebook_embed_dim, codebook_embed_dim),
-                    nn.Tanh(),
-                    nn.Linear(codebook_embed_dim, self.slot_size)  # for quantize
-                )
+            # codebook_embed_dim => 768
+            self.decode_task_layer = nn.Sequential(
+                nn.Linear(codebook_embed_dim, codebook_embed_dim),
+                nn.Tanh(),
+                nn.Linear(codebook_embed_dim, self.slot_size)  # for quantize
+            )
 
     def setup(self, stage):
         # Freeze backbone
@@ -462,7 +441,8 @@ class SlotTrainingWrapper(LightningModule):
 
         slots_1024 = self.out_linear_1024(slots)
 
-        slots_1024 = self.apply_transformer(slots_1024, self.causal_blocks, self.pos_embed_causal_blocks, use_causal_mask=True)
+        # Apply causal transformer
+
 
         # Predict the noise residual
         model_pred = self.unet(
@@ -505,11 +485,11 @@ class SlotTrainingWrapper(LightningModule):
         rec_loss = (1 - (target * rec).sum(dim=-1)).mean()
         return rec_loss
 
-    def apply_transformer(self, slots, transformer_blocks, pos_embed, use_causal_mask=False):
-        pos_embed_applied_slot = slots + pos_embed.repeat(slots.size(0), 1, 1)
+    def apply_transformer(self, slots, transformer_blocks):
+        pos_embed_applied_slot = slots + self.pos_embed.repeat(slots.size(0), 1, 1)
         # Apply Causal Transformer
         for blk in transformer_blocks:
-            pos_embed_applied_slot = blk(pos_embed_applied_slot, use_causal_mask=use_causal_mask)
+            pos_embed_applied_slot = blk(pos_embed_applied_slot, use_causal_mask=False)
         return pos_embed_applied_slot
 
     def get_codebook_util(self, indices):
@@ -523,26 +503,60 @@ class SlotTrainingWrapper(LightningModule):
         with torch.no_grad():
             slots = self.get_slot_embedding(batch, batch_idx)
 
-            slots_1024 = self.out_linear_1024(slots)
-
-            slots_1024 = self.apply_transformer(slots_1024, self.causal_blocks, self.pos_embed_causal_blocks, use_causal_mask=True)
-
-        # Quantize slots
-        quant, embed_ind, loss_codebook = self.quantize(slots_1024)
-
-        if self.cfg.stage2.vq.vq_type == "residual_vq":
-            loss_codebook = loss_codebook.sum()
-
+        # [b, 32, 768] => [b, 32, 32]
+        slots_down = self.encode_task_layer(slots)
+        
+        quant, loss_codebook, embed_ind, perplexity = self.quantize(slots_down)
         logging_dict["loss_codebook"] = loss_codebook
-
+        logging_dict["sim_32"] = F.cosine_similarity(slots_down, quant, dim=-1).mean()
+        logging_dict["perplexity"] = perplexity
+        logging_dict["codebook_util"] = self.get_codebook_util(embed_ind)
+        
         # Flatten the quantized slots
         embed_ind = embed_ind.reshape(slots.shape[0], -1)
 
-        slots_1024_blocks_applied = self.apply_transformer(quant, self.blocks, self.pos_embed, use_causal_mask=False)
+        # codebook replacement
+        replacement_num_batches = self.cfg.stage2.vq.replacement_num_batches
+        #if ((self.global_step + 1) % replacement_num_batches == 0) & (self.global_step <= replacement_num_batches - 2 * replacement_num_batches):
+        if ((batch_idx + 1) % replacement_num_batches == 0) and self.cfg.stage2.vq.replace_codes:
+            num_replaced_codebook = self.quantize.replace_unused_codebooks(replacement_num_batches)
+        else:
+            num_replaced_codebook = -1
 
-        loss_recon = F.mse_loss(slots_1024, slots_1024_blocks_applied, reduction="mean")
-        logging_dict["loss_recon"] = loss_recon
-        logging_dict["sim_768"] = F.cosine_similarity(slots_1024, slots_1024_blocks_applied, dim=-1).mean()
+        # [b, 32, 32] => [b, 32, 768]
+        slots_up_768 = self.decode_task_layer(quant)
+
+        # [b, 32, 768] => [b, 32, 1024]
+        if self.cfg.stage2.use_blocks_image:
+            # Apply transformer blocks
+            slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
+            
+            loss_recon = self.calculate_rec_loss(slots_up_768_blocks_applied, slots)
+            logging_dict["loss_recon"] = loss_recon
+            logging_dict["sim_768"] = F.cosine_similarity(slots_up_768_blocks_applied, slots, dim=-1).mean()
+            # Separate transformer blocks for image
+            slots_up_768_blocks_image_applied = self.apply_transformer(slots_up_768, self.blocks_image)
+            slots_1024 = self.out_linear_1024(slots_up_768_blocks_image_applied)
+
+        else:
+            recon_debug = True
+            if recon_debug:
+                # Recon loss before transformer
+                loss_recon = self.calculate_rec_loss(slots_up_768, slots)
+                logging_dict["loss_recon"] = loss_recon
+                logging_dict["sim_768"] = F.cosine_similarity(slots_up_768, slots, dim=-1).mean()
+
+                # Apply transformer blocks
+                slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
+                slots_1024 = self.out_linear_1024(slots_up_768_blocks_applied)
+            else:
+                # Apply transformer blocks
+                slots_up_768_blocks_applied = self.apply_transformer(slots_up_768, self.blocks)
+                
+                loss_recon = self.calculate_rec_loss(slots_up_768_blocks_applied, slots)
+                logging_dict["loss_recon"] = loss_recon
+                logging_dict["sim_768"] = F.cosine_similarity(slots_up_768_blocks_applied, slots, dim=-1).mean()
+                slots_1024 = self.out_linear_1024(slots_up_768_blocks_applied)
 
         # Compute diffusion loss
         noisy_model_input, noise, timesteps, model_input = self.get_diffusion_noisy_model_input(batch)
@@ -550,7 +564,7 @@ class SlotTrainingWrapper(LightningModule):
         # Predict the noise residual
         # By using the reconstructed slot
         model_pred = self.unet(
-            noisy_model_input, timesteps, slots_1024_blocks_applied,
+            noisy_model_input, timesteps, slots_1024,
         ).sample
 
         # Get the target for loss depending on the prediction type
@@ -569,9 +583,14 @@ class SlotTrainingWrapper(LightningModule):
         logging_dict["loss_diffusion"] = loss_diffusion
 
         # Combine loss
-        loss = self.cfg.stage2.loss_weight.loss_codebook * loss_codebook + \
-                self.cfg.stage2.loss_weight.loss_recon * loss_recon + \
-                self.cfg.stage2.loss_weight.loss_diffusion * loss_diffusion
+        if hasattr(self.cfg.stage2, "vq_type") and self.cfg.stage2.vq_type == "nsvq":
+            # Don't use codebook loss when using nsvq
+            loss = self.cfg.stage2.loss_weight.loss_recon * loss_recon + \
+                    self.cfg.stage2.loss_weight.loss_diffusion * loss_diffusion
+        else:
+            loss = self.cfg.stage2.loss_weight.loss_codebook * loss_codebook + \
+                    self.cfg.stage2.loss_weight.loss_recon * loss_recon + \
+                    self.cfg.stage2.loss_weight.loss_diffusion * loss_diffusion
         logging_dict["loss"] = loss
 
         # loss logging
@@ -587,7 +606,7 @@ class SlotTrainingWrapper(LightningModule):
                 sync_dist=True,
             )
 
-        return loss, slots_1024_blocks_applied
+        return loss, slots_up_768_blocks_applied, slots_1024
 
     def on_train_start(self):
         self.print(f"\n====Traing Stage {self.stage}====")
@@ -666,7 +685,7 @@ class SlotTrainingWrapper(LightningModule):
         if self.stage == 1:
             _, _, slots_1024 = self.get_diffusion_loss(batch, batch_idx, is_validation=True)
         else:
-            _, slots_1024 = self.get_quantize_loss(batch, batch_idx, is_validation=True)
+            _, _, slots_1024 = self.get_quantize_loss(batch, batch_idx, is_validation=True)
 
         # Change validation scheduler
         cur_scheduler = self.scheduler
@@ -698,68 +717,15 @@ class SlotTrainingWrapper(LightningModule):
         generated_image_dir = self.save_path
         try:
             clip_score = calculate_clip_s_for_folder(original_image_dir, generated_image_dir)
-            self.log(
-                "metrics/clip_score",
-                clip_score,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                logger=True,
-                sync_dist=True,
-            )
         except Exception as e:
             self.print(f"Error: {e}")
             clip_score = 0
-
-        try:
-            lpips = calculate_lpips_for_folder(original_image_dir, generated_image_dir)
-            self.log(
-                "metrics/lpips",
-                lpips,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                logger=True,
-                sync_dist=True,
-            )
-        except Exception as e:
-            self.print(f"Error: {e}")
-            lpips = 0
-
-        try:
-            psnr = calculate_psnr_for_folder(original_image_dir, generated_image_dir)
-            self.log(
-                "metrics/psnr",
-                psnr,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                logger=True,
-                sync_dist=True,
-            )
-        except Exception as e:
-            self.print(f"Error: {e}")
-            psnr = 0
-
-        try:
-            ssim = calculate_ssim_for_folder(original_image_dir, generated_image_dir)
-            self.log(
-                "metrics/ssim",
-                ssim,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                logger=True,
-                sync_dist=True,
-            )
-        except Exception as e:
-            self.print(f"Error: {e}")
-            ssim = 0
-
+        
+        self.print(f"clip score: {clip_score}")
         self.log_dict({
             'clip_score': clip_score,
-        }, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-
+        },on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        
         self.log(
             "clip_score_coco_karpathy",
             clip_score,

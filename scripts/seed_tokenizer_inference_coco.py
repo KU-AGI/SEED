@@ -17,7 +17,6 @@ import transformers
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
 
-
 from torch.utils.data import Dataset, ConcatDataset, DataLoader
 from pycocotools.coco import COCO
 from tqdm import tqdm
@@ -29,7 +28,7 @@ pyrootutils.setup_root(__file__, indicator='.project-root', pythonpath=True)
 tokenizer_cfg_path = 'configs/tokenizer/seed_llama_tokenizer_hf.yaml'
 transform_cfg_path = 'configs/transform/clip_transform.yaml'
 
-image_path = 'images/cat.jpg'
+image_path = '/home/zheedong/Projects/SEED/coco/images/val2014/COCO_val2014_000000391895.jpg'
 save_dir = './tokenizer_inference_coco'
 save_path = os.path.join(save_dir, os.path.basename(image_path))
 
@@ -47,7 +46,9 @@ transform = hydra.utils.instantiate(transform_cfg)
 image = Image.open(image_path).convert('RGB')
 
 image_tensor = transform(image).to(device)
-image_ids = tokenizer.encode_image(image_torch=image_tensor)
+
+with torch.cuda.amp.autocast():
+    image_ids = tokenizer.encode_image(image_torch=image_tensor)
 
 images = tokenizer.decode_image(image_ids)
 

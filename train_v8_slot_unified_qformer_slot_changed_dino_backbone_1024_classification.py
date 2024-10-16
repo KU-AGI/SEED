@@ -1,14 +1,15 @@
-# 0930) itc loss 
-
 import os
 from typing import Any, List
 import torch
 from IPython.core.completer import back_latex_name_matcher
+from fontTools.misc.plistlib import start_dict
 from skimage.restoration.uft import image_quad_norm
 from torch.cuda.amp import autocast
 import torch.nn as nn
 from torch.nn import functional as F
 import torch.distributed as dist
+import time
+from tqdm import tqdm
 
 import json
 
@@ -34,40 +35,18 @@ from functools import partial
 from pytorch_lightning.callbacks import ModelSummary
 from pytorch_lightning.utilities import grad_norm
 
-from typing import Any, Callable, Dict, List, Optional, Union
-
 import numpy as np
-import matplotlib.pyplot as plt
 
-from models.seed_qformer.vit import Block
+from datamodules.seed_llama_datamodule import SEEDDataModule
 from models.seed_llama_tokenizer import ImageTokenizer
 
-# from datamodules.seed_llama_datamodule import SEEDDataModule
+from datamodules.imagenet_datamodule import ImageNetDataModule
 
-from calculate_clip_score import calculate_clip_s_for_folder # , calculate_lpips_for_folder, calculate_psnr_for_folder, calculate_ssim_for_folder
-# from utils.config import build_config
+from calculate_clip_score import calculate_clip_s_for_folder, calculate_lpips_for_folder, calculate_psnr_for_folder, \
+    calculate_ssim_for_folder
+from utils.config import build_config
 
-# from lavis.models import load_model
 from lavis.common.dist_utils import is_dist_avail_and_initialized
-
-from diffusers import DPMSolverMultistepScheduler
-
-from models.slot_attention.slot_attn import MultiHeadSTEVESA
-from models.seed_qformer.qformer_quantizer import VectorQuantizer2, NSVQ
-
-from scipy.optimize import linear_sum_assignment
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
-from diffusers import (
-    DiffusionPipeline,
-    AutoencoderKL,
-    DDPMScheduler,
-    StableDiffusionPipeline,
-    UNet2DConditionModel,
-    DiffusionPipeline,
-)
-
-from vector_quantize_pytorch import VectorQuantize
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
@@ -79,6 +58,7 @@ IMG_FLAG = "<image>"
 NUM_IMG_TOKNES = 32
 NUM_IMG_CODES = 8192
 IMAGE_ID_SHIFT = 32000
+
 
 class GatherLayer(torch.autograd.Function):
     """
@@ -100,6 +80,7 @@ class GatherLayer(torch.autograd.Function):
         torch.distributed.all_reduce(all_gradients)
         return all_gradients[torch.distributed.get_rank()]
 
+
 class DINOBackbone(nn.Module):
     def __init__(self, dinov2):
         super().__init__()
@@ -108,27 +89,32 @@ class DINOBackbone(nn.Module):
     def forward(self, x):
         enc_out = self.dinov2.forward_features(x)
         return rearrange(
-            enc_out["x_norm_patchtokens"], 
+            enc_out["x_norm_patchtokens"],
             "b (h w ) c -> b c h w",
             h=int(np.sqrt(enc_out["x_norm_patchtokens"].shape[-2]))
         )
 
-class SlotTrainingWrapper(LightningModule):
+
+class SlotTestWrapper(LightningModule):
     """Training wrapper for Slot
 
     Args:
         LightningModule (cfg, model): model should be ImageTokenizer
-    """    
-    def __init__(self, cfg):
+    """
+
+    def __init__(self, cfg, class_names, val_length):
         super().__init__()
         self.cfg = cfg
         self.stage = cfg.experiment.stage
+        self.class_names = class_names
+        self.val_length = val_length
+        self.acc = 0.0
 
         # Load tokenizer
         self.image_tokenizer = ImageTokenizer(
             model_path=cfg.checkpoint_path.model_path,
-            diffusion_model_path=None, # Diffusion model is loaded in TrainingWrapper
-            device="cpu", # For PyTorch Lightning
+            diffusion_model_path=None,  # Diffusion model is loaded in TrainingWrapper
+            device="cpu",  # For PyTorch Lightning
             load_diffusion=False,
             vq_type=cfg.stage2.vq.type,
             discarding_thre=cfg.stage2.vq.discarding_threshold,
@@ -137,62 +123,25 @@ class SlotTrainingWrapper(LightningModule):
             diffusion_precision=cfg.optimizer.diffusion_precision,
             legacy=cfg.stage2.vq.legacy,
         )
-    
+        
+        if hasattr(self.cfg.stage1, "used_sublayer") and self.cfg.stage1.used_sublayer is not None:
+            self.image_tokenizer.model.Qformer.bert.encoder.config.num_hidden_layers = self.cfg.stage1.used_sublayer
 
-        # 0930) backbone model
-        if hasattr(cfg.stage1, "dino_model_name"):
-            dinov2 = torch.hub.load("facebookresearch/dinov2", cfg.stage1.dino_model_name)
-            self.backbone = DINOBackbone(dinov2).eval()
-            self.visual_embedding_encoder = nn.Linear(1024, 1408)
-            self.image_tokenizer.model.visual_encoder = None
-        else:
-            # Backbone is from ImageTokenizer
-            self.backbone = self.image_tokenizer.model.visual_encoder
+        dinov2 = torch.hub.load("facebookresearch/dinov2", cfg.stage1.dino_model_name)
+        self.backbone = DINOBackbone(dinov2).eval()
+        self.visual_embedding_encoder = nn.Linear(1024, 1408)
+        self.image_tokenizer.model.visual_encoder = None
 
-
+        # self.backbone = self.image_tokenizer.model.visual_encoder
         self.out_layer_norm = nn.LayerNorm(768)
         self.out_linear_1024 = nn.Linear(768, 1024)
 
-        diffusion_precision = "fp16" if cfg.optimizer.diffusion_precision else "fp32"
-        pretrained_model_name = "stabilityai/stable-diffusion-2-1"
-        self.diffusion_model = StableDiffusionPipeline.from_pretrained(pretrained_model_name,
-                                                                torch_dtype=dict(fp16=torch.float16, fp32=torch.float32)[diffusion_precision])
-        # Change to DDPMScheduler
-        self.diffusion_model.scheduler = DDPMScheduler.from_pretrained(
-            pretrained_model_name, subfolder="scheduler", torch_dtype=dict(fp16=torch.float16, fp32=torch.float32)[diffusion_precision])
 
-        # For diffusion DDP
-        self.feature_extractor = self.diffusion_model.feature_extractor
-
-        self.image_encoder = None
-        self.image_normalizer = None
-        self.image_noising_scheduler = None
-
-        if self.diffusion_model.text_encoder is not None:
-            self.clip_tokenizer = self.diffusion_model.tokenizer
-        else:
-            self.clip_tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-
-        if self.diffusion_model.text_encoder is not None:
-            self.text_encoder = self.diffusion_model.text_encoder
-
-        self.unet = self.diffusion_model.unet
-        self.scheduler = self.diffusion_model.scheduler
-        self.vae = self.diffusion_model.vae
-
-        # Scheduler for validation
-        scheduler_args = {}
-        if "variance_type" in self.scheduler.config:
-            variance_type = self.scheduler.config.variance_type
-            
-            if variance_type in ["learned", "learned_range"]:
-                variance_type = "fixed_small"
-
-            scheduler_args["variance_type"] = variance_type
-            
-        self.val_schduler = DPMSolverMultistepScheduler.from_config(
-            self.scheduler.config, **scheduler_args
-        )
+        # Change number of tokens
+        if hasattr(self.cfg.stage1, 'slot_num') and self.cfg.stage1.slot_num is not None:
+            query_tokens_sliced = self.image_tokenizer.model.query_tokens[:, :self.cfg.stage1.slot_num, :].contiguous().view(-1, self.cfg.stage1.slot_num, 768)
+            self.image_tokenizer.model.query_tokens = nn.Parameter(query_tokens_sliced)
+            self.image_tokenizer.model.Qformer.bert.query_length = self.cfg.stage1.slot_num
 
         # For logging
         self.stage = cfg.experiment.stage
@@ -202,8 +151,8 @@ class SlotTrainingWrapper(LightningModule):
 
         self.normalize_diffusion = transforms.Normalize(mean=[0.5], std=[0.5])
         self.normalize_vit = transforms.Normalize(
-                                mean=(0.43216, 0.394666, 0.37645),
-                                std=(0.22803, 0.22145, 0.216989),
+            mean=(0.43216, 0.394666, 0.37645),
+            std=(0.22803, 0.22145, 0.216989),
         )
 
         self.save_path = None
@@ -221,133 +170,23 @@ class SlotTrainingWrapper(LightningModule):
 
         # itc loss
         if hasattr(self.cfg.stage1, "itc_weight") and \
-                    self.cfg.stage1.itc_weight is not None and \
-                    self.cfg.stage1.itc_weight > 0:
+                self.cfg.stage1.itc_weight is not None and \
+                self.cfg.stage1.itc_weight > 0:
 
             self.use_itc = True
             self.temp = nn.Parameter(0.07 * torch.ones([]))
+            self.image_feat_proj = nn.Linear(1024, 1024)
             self.text_feat_proj = nn.Linear(768, 1024)
         else:
             self.use_itc = False
 
-        if self.stage == 2:
-            self.codebook_embed_dim = self.cfg.stage2.vq.codebook_embed_dim
-            self.n_embed = self.cfg.stage2.vq.n_embed
-
-            print(f"n_embed: {self.n_embed}, codebook_embed_dim: {self.codebook_embed_dim}")
-            # TODO : config slot_embed
-            slot_embed = 1024
-
-            if self.cfg.stage2.vq.vq_type == "vq":
-                self.quantize = VectorQuantize(
-                    dim=slot_embed,
-                    codebook_size=self.n_embed,
-                    codebook_dim=self.codebook_embed_dim
-                )
-            elif self.cfg.stage2.vq.vq_type == "residual_vq":
-                from vector_quantize_pytorch import ResidualVQ
-                self.quantize = ResidualVQ(
-                    dim=slot_embed,
-                    num_quantizers=self.cfg.stage2.vq.num_quantizers,
-                    codebook_size=self.n_embed,
-                    codebook_dim=self.codebook_embed_dim,
-                    shared_codebook=True,
-                )
-
-            self.pos_embed = nn.Parameter(torch.zeros(1, 32, slot_embed))
-            self.blocks = nn.ModuleList([
-                Block(dim=slot_embed,
-                      # num_heads=12,
-                      num_heads=16,
-                      mlp_ratio=4.0,
-                      qkv_bias=True,
-                      qk_scale=None,
-                      drop=0.0,
-                      attn_drop=0.0,
-                      drop_path=0.0,
-                      norm_layer=partial(nn.LayerNorm, eps=1e-6)) for _ in range(self.cfg.stage2.blocks_layers)
-            ])
-
-            if self.cfg.stage2.use_blocks_image and \
-                    self.cfg.stage2.blocks_image_layers is not None:
-
-                self.use_blocks_image = True
-                self.pos_embed_image = nn.Parameter(torch.zeros(1, 32, slot_embed))
-                self.blocks_image = nn.ModuleList([
-                    Block(dim=slot_embed,
-                          num_heads=16,
-                          mlp_ratio=4.0,
-                          qkv_bias=True,
-                          qk_scale=None,
-                          drop=0.0,
-                          attn_drop=0.0,
-                          drop_path=0.0,
-                          norm_layer=partial(nn.LayerNorm, eps=1e-6)) for _ in
-                    range(self.cfg.stage2.blocks_image_layers)
-                ])
-            else:
-                self.use_blocks_image = False
+        self.text_embeddings = None
 
     def setup(self, stage):
         # Freeze backbone
         if hasattr(self, "backbone") and self.backbone is not None:
             for param in self.backbone.parameters():
                 param.requires_grad = False
-
-        # Diffusion frozen
-        if hasattr(self, "image_normalizer") and self.image_normalizer is not None:
-            for param in self.image_normalizer.parameters():
-                param.requires_grad = False
-        if hasattr(self, "text_encoder") and self.text_encoder is not None:
-            for param in self.text_encoder.parameters():
-                param.requires_grad = False
-        # Freeze VAE
-        for param in self.vae.parameters():
-            param.requires_grad = False
-
-        if self.stage == 1:
-            if hasattr(self.cfg.stage1, "unfreeze_unet"):
-                # casting to float32
-                self.unet = self.unet.to(dtype=torch.float32)
-            for name, param in self.unet.named_parameters():
-                # If self.cfg.stage1.unfreeze_unet exists, unfreeze cross attention layer
-                if hasattr(self.cfg.stage1, "unfreeze_unet") and self.cfg.stage1.unfreeze_unet:
-                    if any(x in name for x in ["attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out"]):
-                        print(f"Unfreeze {name}")
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = False
-                else:
-                    param.requires_grad = False
-
-        # Freezing for stage 2
-        if self.stage == 2:
-            if hasattr(self.cfg.stage2, "unfreeze_unet"):
-                # casting to float32
-                self.unet = self.unet.to(dtype=torch.float32)
-            for name, param in self.unet.named_parameters():
-                # If self.cfg.stage2.unfreeze_unet exists, unfreeze cross attention layer
-                if hasattr(self.cfg.stage2, "unfreeze_unet") and self.cfg.stage2.unfreeze_unet:
-                    if any(x in name for x in ["attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out"]):
-                        print(f"Unfreeze {name}")
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = False
-                else:
-                    param.requires_grad = False
-
-            # Freeze stage 1 model
-            for param in self.image_tokenizer.model.Qformer.parameters():
-                param.requires_grad = False
-
-            # Allow to train the out layer norm and out linear
-            if hasattr(self.cfg.stage2, "unfreeze_linear") and \
-                self.cfg.stage2.unfreeze_linear:
-                for param in self.out_linear_1024.parameters():
-                    param.requires_grad = True
-            else:
-                for param in self.out_linear_1024.parameters():
-                    param.requires_grad = False
 
         ## make dump folder
         os.makedirs(self.cfg.result_file_path, exist_ok=True)
@@ -372,7 +211,7 @@ class SlotTrainingWrapper(LightningModule):
         tensor_all = GatherLayer.apply(tensors)
 
         return torch.cat(tensor_all, dim=0)
-    
+
     @torch.no_grad()
     def concat_all_gather(self, tensor):
         """
@@ -417,6 +256,10 @@ class SlotTrainingWrapper(LightningModule):
         return noisy_model_input, noise, timesteps, model_input
 
     def get_image_feats(self, batch, batch_idx: int):
+        is_check_time = False
+        if is_check_time:
+            cur_time = time.time()
+
         if len(batch) == 3:
             image, text, image_id = batch
         elif len(batch) == 2:
@@ -428,9 +271,16 @@ class SlotTrainingWrapper(LightningModule):
         image = self.normalize_vit(image)
 
         with torch.no_grad():
-            image_embeds = self.image_tokenizer.model.ln_vision(
-                self.image_tokenizer.model.visual_encoder(image)
-            )
+            image_embeds = self.backbone(image)  # [b, 1024, 16, 16]
+
+        if is_check_time:
+            self.print("backbone time: ", time.time() - cur_time)
+            cur_time = time.time()
+
+        image_embeds = rearrange(image_embeds, "b d h w -> b (h w) d")  # [b, 256, 1024]
+
+        image_embeds = self.visual_embedding_encoder(image_embeds)  # [b, 256, 1408]
+
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(self.device)
 
         query_tokens = self.image_tokenizer.model.query_tokens.expand(image_embeds.shape[0], -1, -1)
@@ -443,8 +293,12 @@ class SlotTrainingWrapper(LightningModule):
             encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_atts,
             return_dict=True,
-            use_slot=True,      # Important! Use slot
+            use_slot=True,  # Important! Use slot
         )
+
+        if is_check_time:
+            self.print("Qformer time: ", time.time() - cur_time)
+            cur_time = time.time()
 
         image_feats = query_output.last_hidden_state
 
@@ -455,7 +309,7 @@ class SlotTrainingWrapper(LightningModule):
             image, text, image_id = batch
         elif len(batch) == 2:
             image, text = batch
-        
+
         text_tokens = self.image_tokenizer.model.tokenizer(
             text,
             padding="max_length",
@@ -468,27 +322,36 @@ class SlotTrainingWrapper(LightningModule):
             text_tokens.input_ids.to(self.device),
             attention_mask=text_tokens.attention_mask.to(self.device),
             return_dict=True,
-            use_slot=self.cfg.stage1.use_slot,
+            use_slot=True,
         )
 
         text_feat = text_output.last_hidden_state
-        
+
         return text_feat
 
-    def get_itc_loss_use_last_token(self, batch, batch_idx: int, is_validation=False):
-        image_feats = self.get_image_feats(batch, batch_idx)
+    def get_itc_loss_use_last_token(self, batch, batch_idx: int, is_validation=False, image_feats=None):
+        if image_feats is None:
+            _, image_feats = self.get_slot_embedding(batch, batch_idx)
+        
+        b = image_feats.size(0)
+
+        assert image_feats.size(-1) == 1024
+
+        image_feats = self.image_feat_proj(image_feats)  # [b, 32, 1024]
         image_feats = F.normalize(image_feats, dim=-1)
         image_feats = rearrange(image_feats[:, -1, :], "b d -> b 1 d").contiguous()
-        
-        text_feats = self.get_text_feats(batch, batch_idx)
+
+        text_feats = self.get_text_feats(batch, batch_idx) # [b, seq, 768]
+        text_feats = self.text_feat_proj(text_feats)    # [b, seq, 1024]
         text_feats = F.normalize(text_feats, dim=-1)
-        text_feats = text_feat[:, 0, :]
+        text_feats = text_feats[:, 0, :].contiguous()
 
         image_feats_all = self.all_gather_with_grad(image_feats)
         text_feats_all = self.all_gather_with_grad(text_feats)
 
         sim_q2t = torch.matmul(
-            rearrange(image_feats, "bs n d -> bs 1 n d"), rearrange(text_feat_all, "(bs ngpus) d -> (bs ngpus) d 1", bs=b)
+            rearrange(image_feats, "bs n d -> bs 1 n d"),
+            rearrange(text_feats_all, "(bs ngpus) d -> (bs ngpus) d 1", bs=b)
         ).squeeze()
         # [batch_size, batch_size*num_gpu, num_query_tokens]
 
@@ -501,7 +364,8 @@ class SlotTrainingWrapper(LightningModule):
 
         # text-query similarity: [batch_size, batch_size*num_gpu, num_query_tokens]
         sim_t2q = torch.matmul(
-            rearrange(text_feat, "bs d -> bs 1 1 d"), rearrange(image_feats_all, "(bs ngpus) n d -> (bs ngpus) d n", bs=b)
+            rearrange(text_feats, "bs d -> bs 1 1 d"),
+            rearrange(image_feats_all, "(bs ngpus) n d -> (bs ngpus) d n", bs=b)
         ).squeeze()
         # [batch_size, batch_size*num_gpu, num_query_tokens]
 
@@ -513,23 +377,17 @@ class SlotTrainingWrapper(LightningModule):
         sim_t2i = sim_t2i / self.temp  # [batch_size, batch_size*num_gpu]
 
         rank = dist.get_rank()
-        bs = image.size(0)
+        bs = image_feats.size(0)
         targets = torch.linspace(rank * bs, rank * bs + bs - 1, bs, dtype=int).to(
-            image.device
+            self.device
         )
 
         loss_itc = (
-            F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
-            + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
-        ) / 2
-
-        self.log(
-            f"train/loss_itc",
-            loss_itc,
-        )
+                           F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
+                           + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
+                   ) / 2
 
         return loss_itc
-        
 
     def get_slot_embedding(self, batch, batch_idx: int, image_feats=None):
         if image_feats is None:
@@ -539,17 +397,54 @@ class SlotTrainingWrapper(LightningModule):
 
         return slots, slots_1024
 
-    def get_diffusion_loss(self, batch, batch_idx: int, is_validation=False):
+    def get_stage1_loss(self, batch, batch_idx: int, is_validation=False):
+        is_check_time = False
+        # Debug
+        if is_check_time:
+            self.print("============ One batch start ============")
+            start_time = time.time()
+            cur_time = time.time()
+
         noisy_model_input, noise, timesteps, model_input = self.get_diffusion_noisy_model_input(batch)
+
+        # Debug
+        if is_check_time:
+            self.print("get_diffusion_noisy_model_input time: ", time.time() - cur_time)
+            cur_time = time.time()
+
         logging_dict = {}
 
         image_feats = self.get_image_feats(batch, batch_idx)
+
+        if is_check_time:
+            self.print("get_image_feats time: ", time.time() - cur_time)
+            cur_time = time.time()
+
         slots, slots_1024 = self.get_slot_embedding(batch, batch_idx, image_feats)
+
+        if is_check_time:
+            self.print("get_slot_embedding time: ", time.time() - cur_time)
+            cur_time = time.time()
+
+        # itc loss calculation
+        if self.use_itc:
+            loss_itc = self.get_itc_loss_use_last_token(batch, batch_idx, is_validation, slots_1024)
+            logging_dict["loss_itc"] = loss_itc
+
+        if is_check_time:
+            self.print("get_itc_loss_use_last_token time: ", time.time() - cur_time)
+            cur_time = time.time()
+
+        # Diffusion loss calculation
 
         # Predict the noise residual
         model_pred = self.unet(
             noisy_model_input, timesteps, slots_1024,
         ).sample
+
+        if is_check_time:
+            self.print("unet time: ", time.time() - cur_time)
+            cur_time = time.time()
 
         # Get the target for loss depending on the prediction type
         if self.scheduler.config.prediction_type == "epsilon":
@@ -563,9 +458,19 @@ class SlotTrainingWrapper(LightningModule):
 
         # Compute instance loss
         loss_diffusion = F.mse_loss(model_pred.float(),
-                            target.float(), reduction="mean")
+                                    target.float(), reduction="mean")
         logging_dict["loss_diffusion"] = loss_diffusion
-        
+
+        if is_check_time:
+            self.print("loss_diffusion time: ", time.time() - cur_time)
+            cur_time = time.time()
+
+        # Combine loss
+        loss = loss_diffusion
+        if self.use_itc:
+            loss += self.cfg.stage1.itc_weight * loss_itc
+            logging_dict["loss"] = loss
+
         # loss logging
         cur_stage = "train" if not is_validation else "val"
         for key in logging_dict.keys():
@@ -578,17 +483,21 @@ class SlotTrainingWrapper(LightningModule):
                 logger=True,
                 sync_dist=True,
             )
-        
-        return loss_diffusion, image_feats, slots, slots_1024
-    
+
+        if is_check_time:
+            self.print("loss logging time: ", time.time() - cur_time)
+            self.print("one batch time: ", time.time() - start_time)
+
+        return loss, image_feats, slots, slots_1024
+
     def calculate_rec_loss(self, rec, target):
         target = target / target.norm(dim=-1, keepdim=True)
         rec = rec / rec.norm(dim=-1, keepdim=True)
         rec_loss = (1 - (target * rec).sum(dim=-1)).mean()
         return rec_loss
 
-    def apply_transformer(self, slots, transformer_blocks):
-        pos_embed_applied_slot = slots + self.pos_embed.repeat(slots.size(0), 1, 1)
+    def apply_transformer(self, slots, transformer_blocks, pos_embed):
+        pos_embed_applied_slot = slots + pos_embed.repeat(slots.size(0), 1, 1)
         # Apply Causal Transformer
         for blk in transformer_blocks:
             pos_embed_applied_slot = blk(pos_embed_applied_slot, use_causal_mask=False)
@@ -603,7 +512,10 @@ class SlotTrainingWrapper(LightningModule):
         logging_dict = {}
 
         with torch.no_grad():
-            slots, slots_1024 = self.get_slot_embedding(batch, batch_idx)
+            image_feats = self.get_image_feats(batch, batch_idx)
+
+            # GT slots
+            slots, slots_1024 = self.get_slot_embedding(batch, batch_idx, image_feats)
 
         # Quantize slots
         quant, embed_ind, loss_codebook = self.quantize(slots_1024)
@@ -616,20 +528,37 @@ class SlotTrainingWrapper(LightningModule):
         # Flatten the quantized slots
         embed_ind = embed_ind.reshape(slots.shape[0], -1)
 
-        slots_1024_blocks_applied = self.apply_transformer(quant, self.blocks)
+        # Reconstruct the slots
+        slots_1024_blocks_applied = self.apply_transformer(quant, self.blocks, self.pos_embed)
 
         loss_recon = F.mse_loss(slots_1024, slots_1024_blocks_applied, reduction="mean")
         logging_dict["loss_recon"] = loss_recon
         logging_dict["sim_768"] = F.cosine_similarity(slots_1024, slots_1024_blocks_applied, dim=-1).mean()
+
+        # Compute itc loss
+        if self.use_itc:
+            loss_itc = self.get_itc_loss_use_last_token(batch, batch_idx, is_validation, slots_1024_blocks_applied)
+            logging_dict["loss_itc"] = loss_itc
 
         # Compute diffusion loss
         noisy_model_input, noise, timesteps, model_input = self.get_diffusion_noisy_model_input(batch)
 
         # Predict the noise residual
         # By using the reconstructed slot
-        model_pred = self.unet(
-            noisy_model_input, timesteps, slots_1024_blocks_applied,
-        ).sample
+        if self.use_blocks_image:
+            slots_1024_blocks_image_applied = self.apply_transformer(
+                quant, self.blocks_image, self.pos_embed_image
+            )
+
+            # Calculate diffusion loss by using blocks_image applied slot
+            model_pred = self.unet(
+                noisy_model_input, timesteps, slots_1024_blocks_image_applied,
+            ).sample
+        else:
+            # Don't use blocks_image, directly use reconstructed slot
+            model_pred = self.unet(
+                noisy_model_input, timesteps, slots_1024_blocks_applied,
+            ).sample
 
         # Get the target for loss depending on the prediction type
         if self.scheduler.config.prediction_type == "epsilon":
@@ -643,13 +572,16 @@ class SlotTrainingWrapper(LightningModule):
 
         # Compute instance loss
         loss_diffusion = F.mse_loss(model_pred.float(),
-                            target.float(), reduction="mean")
+                                    target.float(), reduction="mean")
         logging_dict["loss_diffusion"] = loss_diffusion
 
         # Combine loss
         loss = self.cfg.stage2.loss_weight.loss_codebook * loss_codebook + \
-                self.cfg.stage2.loss_weight.loss_recon * loss_recon + \
-                self.cfg.stage2.loss_weight.loss_diffusion * loss_diffusion
+               self.cfg.stage2.loss_weight.loss_recon * loss_recon + \
+               self.cfg.stage2.loss_weight.loss_diffusion * loss_diffusion
+        if self.use_itc:
+            loss += self.cfg.stage1.itc_weight * loss_itc
+
         logging_dict["loss"] = loss
 
         # loss logging
@@ -674,7 +606,7 @@ class SlotTrainingWrapper(LightningModule):
 
         self.print("Save config")
         self.save_config()
-    
+
     def training_step(self, batch, batch_idx: int):
         if len(batch) == 3:
             image, text, image_id = batch
@@ -684,10 +616,10 @@ class SlotTrainingWrapper(LightningModule):
         self.B = image.shape[0]
 
         if self.stage == 1:
-            loss, *_ = self.get_diffusion_loss(batch, batch_idx)
+            loss, *_ = self.get_stage1_loss(batch, batch_idx)
         elif self.stage == 2:
             loss, *_ = self.get_quantize_loss(batch, batch_idx)
-        
+
         return loss
 
     def on_before_optimizer_step(self, optimizer, optimizer_idx):
@@ -727,7 +659,7 @@ class SlotTrainingWrapper(LightningModule):
                     norm_blocks[norm],
                     global_step=self.global_step,
                 )
-    
+
     def on_validation_epoch_start(self):
         return
 
@@ -740,13 +672,17 @@ class SlotTrainingWrapper(LightningModule):
 
         self.save_path = f"{tb_log_dir}/reconstructed_images"
         os.makedirs(self.save_path, exist_ok=True)
-        
+
         self.save_path = f"{tb_log_dir}/reconstructed_images/epoch_{self.current_epoch}"
         os.makedirs(self.save_path, exist_ok=True)
 
-        img, text, image_id = batch
+        if len(batch) == 3:
+            img, text, image_id = batch
+        elif len(batch) == 2:
+            img, text = batch
+
         if self.stage == 1:
-            _, _, _, slots_1024 = self.get_diffusion_loss(batch, batch_idx, is_validation=True)
+            _, _, _, slots_1024 = self.get_stage1_loss(batch, batch_idx, is_validation=True)
         else:
             _, _, slots_1024 = self.get_quantize_loss(batch, batch_idx, is_validation=True)
 
@@ -840,8 +776,8 @@ class SlotTrainingWrapper(LightningModule):
 
         self.log_dict({
             'clip_score': clip_score,
-        },on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        
+        }, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+
         self.log(
             "clip_score_coco_karpathy",
             clip_score,
@@ -852,66 +788,70 @@ class SlotTrainingWrapper(LightningModule):
             sync_dist=True,
         )
 
-    def configure_optimizers(self):
-        # optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3, betas=(0.9, 0.999), weight_decay=1e-8)
-        lr = self.cfg.optimizer.max_lr
-        betas = (self.cfg.hyperparameters.beta_1, self.cfg.hyperparameters.beta_2)
-        weight_decay = self.cfg.hyperparameters.weight_decay
+    @torch.no_grad()
+    def on_test_start(self) -> None:
+        self.acc = 0
+        self.text_embeddings = []
+        for class_name in tqdm(self.class_names):
+            prompt = f"A photo of {class_name}"
+            # Text embedding
+            text_tokens = self.image_tokenizer.model.tokenizer(
+                prompt,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=128,
+            )
 
-        num_parameters = 0
-        p_wd, p_non_wd = [], []
-        for n, p in self.named_parameters():
-            '''
-            if not p.requires_grad:
-                continue  # frozen weights
-            if p.ndim < 2 or "bias" in n or "ln" in n or "bn" in n:
-                p_non_wd.append(p)
-            else:
-                p_wd.append(p)
-            '''
-            p_wd.append(p)
-            num_parameters += p.data.nelement()
+            text_output = self.image_tokenizer.model.Qformer.bert(
+                text_tokens.input_ids.to(self.device),
+                attention_mask=text_tokens.attention_mask.to(self.device),
+                return_dict=True,
+                use_slot=True,
+            )
 
-        self.print(f"number of parameters: {num_parameters}")
+            text_feat = text_output.last_hidden_state  # Only use [CLS] Token
+            self.text_embeddings.append(text_feat)
 
-        optim_params = [
-            {
-                "params": p_wd,
-                "weight_decay": float(weight_decay),
-            },
-            {"params": p_non_wd, "weight_decay": 0},
-        ]
+        self.text_embeddings = torch.cat(self.text_embeddings, dim=0)   # [1000, 768]
 
-        optimizer = torch.optim.AdamW(
-            optim_params,
-            lr=lr,
-            betas=betas,
-            weight_decay=weight_decay
-        )
+        self.text_embeddings = self.text_feat_proj(self.text_embeddings)    # [1000, 1024]
+        self.text_embeddings = F.normalize(self.text_embeddings, dim=-1)
+        self.text_embeddings = self.text_embeddings[:, 0, :].contiguous()
 
-        #scheduler = transformers.get_cosine_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=100, num_training_steps=5000)
-        num_training_steps = self.cfg.experiment.total_training_steps
-        num_warmup_steps = self.cfg.experiment.num_warmup_steps
-        scheduler = transformers.get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps
-        )
+    @torch.no_grad()
+    def test_step(self, batch, batch_idx):
+        image_feats = self.get_image_feats(batch, batch_idx)
 
-        lr_scheduler_config = {
-            "scheduler": scheduler,
-            "name": "learning_rate",
-            "interval": "step",
-            "frequency": 1,
-        }
+        slots, slots_1024 = self.get_slot_embedding(batch, batch_idx, image_feats)
 
-        return {"optimizer": optimizer,
-                "lr_scheduler": lr_scheduler_config,}
-        
+        slots_1024 = F.normalize(slots_1024, dim=-1)
+        slots_1024_last_token = slots_1024[:, -1, :] # [b, 1024]
+
+        # Compare similarity with text embeddings
+        sim = torch.matmul(
+            self.text_embeddings,
+            rearrange(slots_1024_last_token, "b d -> d b")
+        ).T   # [b, 1000]
+
+        #  Get prediction for batch
+        _, pred = sim.max(dim=-1)
+
+        # Get accuracy
+        self.acc += (pred == batch[2]).float().sum().item()
+
+        loss_itc = F.cross_entropy(sim, batch[2], label_smoothing=0.1)
+        self.print(f"Loss ITC: {loss_itc}")
+
+    def on_test_end(self) -> None:
+        self.acc = self.acc / 50000
+        self.print(f"Accuracy :{self.acc * 100} %")
+        print(f"Accuracy :{self.acc * 100} %")
+
 if __name__ == "__main__":
     cfg, cfg_yaml = build_config()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
     seed_everything(cfg.experiment.seed, workers=True)
 
     transform_cfg = OmegaConf.load(cfg.transform_cfg_path)
@@ -919,25 +859,18 @@ if __name__ == "__main__":
 
     os.makedirs(cfg.result_file_path, exist_ok=True)
 
-    datamodule = SEEDDataModule(cfg, transform=transform, use_coco_val=cfg.dataset.val_config.use_coco_val)
+    datamodule = ImageNetDataModule(batch_size=64)
     datamodule.setup()
-    train_dataloader = datamodule.train_dataloader()
+
+    class_names = datamodule.val_dataset.class_names
+
+    # Debug
+    # datamodule = SEEDDataModule(cfg, transform=transform, use_coco_val=cfg.dataset.val_config.use_coco_val)
+
     val_dataloader = datamodule.val_dataloader()
 
-    cfg.experiment.total_training_steps = datamodule.total_training_steps
-
-    tb_logger = pl_loggers.TensorBoardLogger(save_dir=cfg.result_file_path)
-    lr_logger = pl.callbacks.LearningRateMonitor(logging_interval="step")
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        save_top_k=1,
-        monitor="clip_score_coco_karpathy",
-        mode="max",
-        every_n_epochs=1,
-        save_last=True,
-    )
-
-    if not cfg.experiment.enable_checkpointing:
-        print("############### WARNING: Checkpointing is disabled ###############")
+    # val_dataloader = datamodule.val_dataloader()
+    val_length = len(val_dataloader)
 
     strategy = DDPStrategy(
         find_unused_parameters=cfg.experiment.find_unused_parameters,
@@ -950,14 +883,13 @@ if __name__ == "__main__":
         strategy=strategy,
         max_epochs=cfg.experiment.max_epochs,
         deterministic=cfg.experiment.deterministic,
-        logger=tb_logger,
         log_every_n_steps=cfg.experiment.log_every_n_steps,
         val_check_interval=cfg.experiment.val_check_interval,
         # check_val_every_n_epoch=cfg.experiment.check_val_every_n_epoch,
         enable_checkpointing=cfg.experiment.enable_checkpointing,
         num_sanity_val_steps=cfg.experiment.num_sanity_val_steps,
         precision=str(cfg.optimizer.precision),
-        callbacks=[ModelSummary(max_depth=3), lr_logger, checkpoint_callback],
+        callbacks=[ModelSummary(max_depth=3)],
         accumulate_grad_batches=cfg.experiment.grad_accumulation,
         gradient_clip_val=cfg.experiment.grad_clip_val,
     )
@@ -966,30 +898,17 @@ if __name__ == "__main__":
         raise ValueError("Only checkpoint or finetune")
 
     if cfg.load_weight:
-        wrapper = SlotTrainingWrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg, strict=False)
+        print(f"Load weight from {cfg.weight_path}")
+        wrapper = SlotTestWrapper.load_from_checkpoint(cfg.weight_path, cfg=cfg, class_names=class_names, val_length=val_length, strict=False)
     else:
-        wrapper = SlotTrainingWrapper(cfg)
+        wrapper = SlotTestWrapper(cfg, class_names=class_names)
         if cfg.experiment.stage == 1:
             print(f"Stage 1 init from {cfg.checkpoint_path.model_path}")
         elif cfg.experiment.stage == 2:
             print(f"Stage 2 init from {cfg.weight_path}")
 
     wrapper.setup("fit")
-    
-    if cfg.resume:
-        # Resume training
-        if cfg.weight_path is None:
-            raise ValueError("checkpoint_path is None")
-        else:
-            print(f"Resume training from {cfg.weight_path}")
-            trainer.fit(
-                wrapper, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader,
-                ckpt_path=cfg.weight_path
-            )
-    else:
-        print("Start training")
-        trainer.fit(
-            wrapper, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader
-        )
-    
+
+    trainer.test(wrapper, dataloaders=val_dataloader)
+
     trainer.strategy.barrier()

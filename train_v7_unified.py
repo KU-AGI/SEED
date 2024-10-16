@@ -106,7 +106,11 @@ class SEEDTrainingWrapper(LightningModule):
         # For diffusion DDP
         if self.image_tokenizer.diffusion_model is not None:
             self.feature_extractor = self.image_tokenizer.diffusion_model.feature_extractor
-            self.image_encoder = self.image_tokenizer.diffusion_model.image_encoder
+            # self.image_encoder = self.image_tokenizer.diffusion_model.image_encoder
+            # Change to same as original Code
+            clip_path = 'pretrained/CLIP-ViT-H-14-laion2B-s32B-b79K'
+            self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(clip_path, torch_dtype=torch.float16)
+
             self.image_normalizer = self.image_tokenizer.diffusion_model.image_normalizer
             self.image_noising_scheduler = self.image_tokenizer.diffusion_model.image_noising_scheduler
             self.tokenizer = self.image_tokenizer.diffusion_model.tokenizer
